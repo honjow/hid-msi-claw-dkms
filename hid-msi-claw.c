@@ -431,20 +431,22 @@ static int msi_claw_await_ack(struct hid_device *hdev)
 		goto msi_claw_await_ack_err;
 	}
 
-	ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 1000);
-	if (ret < 0) {
-		hid_err(hdev, "hid-msi-claw failed to read ack: %d\n", ret);
-		goto msi_claw_await_ack_err;
-	} else if (ret != MSI_CLAW_READ_SIZE) {
-		hid_err(hdev, "hid-msi-claw invalid read: expected %d bytes, got %d\n", MSI_CLAW_READ_SIZE, ret);
-		ret = -EINVAL;
-		goto msi_claw_await_ack_err;
-	}
+	while (1) {
+		ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 1000);
+		if (ret < 0) {
+			hid_err(hdev, "hid-msi-claw failed to read ack: %d\n", ret);
+			goto msi_claw_await_ack_err;
+		} else if (ret != MSI_CLAW_READ_SIZE) {
+			hid_err(hdev, "hid-msi-claw invalid read: expected %d bytes, got %d\n", MSI_CLAW_READ_SIZE, ret);
+			ret = -EINVAL;
+			goto msi_claw_await_ack_err;
+		}
 
-	if (buffer[4] != (uint8_t)MSI_CLAW_COMMAND_TYPE_ACK) {
-		hid_err(hdev, "hid-msi-claw received invalid response: expected ack 0x06, got 0x%02x\n", buffer[4]);
-		ret = -EINVAL;
-		goto msi_claw_await_ack_err;
+		if (buffer[4] == (uint8_t)MSI_CLAW_COMMAND_TYPE_ACK)
+			break;
+
+		/* Skip non-ACK responses (e.g. from external tools) */
+		hid_notice(hdev, "hid-msi-claw skipping non-ACK response: 0x%02x\n", buffer[4]);
 	}
 
 	ret = 0;
