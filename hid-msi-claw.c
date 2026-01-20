@@ -55,6 +55,137 @@ static const char* mkeys_function_map[] =
 	"combination",
 };
 
+enum msi_claw_m_key {
+	MSI_CLAW_M1_KEY = 0,
+	MSI_CLAW_M2_KEY = 1,
+
+	MSI_CLAW_M_KEY_MAX,
+};
+
+static const struct {
+	const char *name;
+	uint8_t code;
+} m_remap_key_map[] = {
+	/* Gamepad buttons */
+	{"BTN_DPAD_UP", 0x01},
+	{"BTN_DPAD_DOWN", 0x02},
+	{"BTN_DPAD_LEFT", 0x03},
+	{"BTN_DPAD_RIGHT", 0x04},
+	{"BTN_TL", 0x05},
+	{"BTN_TR", 0x06},
+	{"BTN_THUMBL", 0x07},
+	{"BTN_THUMBR", 0x08},
+	{"BTN_SOUTH", 0x09},
+	{"BTN_EAST", 0x0a},
+	{"BTN_NORTH", 0x0b},
+	{"BTN_WEST", 0x0c},
+	{"BTN_MODE", 0x0d},
+	{"BTN_SELECT", 0x0e},
+	{"BTN_START", 0x0f},
+	/* Keyboard keys */
+	{"KEY_ESC", 0x32},
+	{"KEY_F1", 0x33},
+	{"KEY_F2", 0x34},
+	{"KEY_F3", 0x35},
+	{"KEY_F4", 0x36},
+	{"KEY_F5", 0x37},
+	{"KEY_F6", 0x38},
+	{"KEY_F7", 0x39},
+	{"KEY_F8", 0x3a},
+	{"KEY_F9", 0x3b},
+	{"KEY_F10", 0x3c},
+	{"KEY_F11", 0x3d},
+	{"KEY_F12", 0x3e},
+	{"KEY_GRAVE", 0x3f},
+	{"KEY_1", 0x40},
+	{"KEY_2", 0x41},
+	{"KEY_3", 0x42},
+	{"KEY_4", 0x43},
+	{"KEY_5", 0x44},
+	{"KEY_6", 0x45},
+	{"KEY_7", 0x46},
+	{"KEY_8", 0x47},
+	{"KEY_9", 0x48},
+	{"KEY_0", 0x49},
+	{"KEY_MINUS", 0x4a},
+	{"KEY_EQUAL", 0x4b},
+	{"KEY_BACKSPACE", 0x4c},
+	{"KEY_TAB", 0x4d},
+	{"KEY_Q", 0x4e},
+	{"KEY_W", 0x4f},
+	{"KEY_E", 0x50},
+	{"KEY_R", 0x51},
+	{"KEY_T", 0x52},
+	{"KEY_Y", 0x53},
+	{"KEY_U", 0x54},
+	{"KEY_I", 0x55},
+	{"KEY_O", 0x56},
+	{"KEY_P", 0x57},
+	{"KEY_LEFTBRACE", 0x58},
+	{"KEY_RIGHTBRACE", 0x59},
+	{"KEY_BACKSLASH", 0x5a},
+	{"KEY_CAPSLOCK", 0x5b},
+	{"KEY_A", 0x5c},
+	{"KEY_S", 0x5d},
+	{"KEY_D", 0x5e},
+	{"KEY_F", 0x5f},
+	{"KEY_G", 0x60},
+	{"KEY_H", 0x61},
+	{"KEY_J", 0x62},
+	{"KEY_K", 0x63},
+	{"KEY_L", 0x64},
+	{"KEY_SEMICOLON", 0x65},
+	{"KEY_LEFTSHIFT", 0x66},
+	{"KEY_APOSTROPHE", 0x67},
+	{"KEY_ENTER", 0x68},
+	{"KEY_Z", 0x69},
+	{"KEY_X", 0x6a},
+	{"KEY_C", 0x6b},
+	{"KEY_V", 0x6c},
+	{"KEY_B", 0x6d},
+	{"KEY_N", 0x6e},
+	{"KEY_M", 0x6f},
+	{"KEY_LEFTCTRL", 0x70},
+	{"KEY_RIGHTSHIFT", 0x71},
+	{"KEY_COMMA", 0x72},
+	{"KEY_DOT", 0x73},
+	{"KEY_SLASH", 0x74},
+	{"KEY_LEFTALT", 0x75},
+	{"KEY_LEFTMETA", 0x76},
+	{"KEY_RIGHTCTRL", 0x77},
+	{"KEY_RIGHTALT", 0x78},
+	{"KEY_SPACE", 0x79},
+	{"KEY_INSERT", 0x7a},
+	{"KEY_HOME", 0x7b},
+	{"KEY_PAGEUP", 0x7c},
+	{"KEY_DELETE", 0x7d},
+	{"KEY_END", 0x7e},
+	{"KEY_PAGEDOWN", 0x7f},
+	{"KEY_KPENTER", 0x8a},
+	{"KEY_KP0", 0x8b},
+	{"KEY_KP1", 0x8c},
+	{"KEY_KP2", 0x8d},
+	{"KEY_KP3", 0x8e},
+	{"KEY_KP4", 0x8f},
+	{"KEY_KP5", 0x90},
+	{"KEY_KP6", 0x91},
+	{"KEY_KP7", 0x92},
+	{"KEY_KP8", 0x93},
+	{"KEY_KP9", 0x94},
+	/* Disabled */
+	{"disabled", 0xff},
+};
+
+static const uint8_t m_remap_addr_old[MSI_CLAW_M_KEY_MAX][2] = {
+	{0x00, 0x7a},  /* M1 */
+	{0x01, 0x1f},  /* M2 */
+};
+
+static const uint8_t m_remap_addr_new[MSI_CLAW_M_KEY_MAX][2] = {
+	{0x00, 0xbb},  /* M1 */
+	{0x01, 0x64},  /* M2 */
+};
+
 enum msi_claw_command_type {
 	MSI_CLAW_COMMAND_TYPE_ENTER_PROFILE_CONFIG = 0x01,
 	MSI_CLAW_COMMAND_TYPE_EXIT_PROFILE_CONFIG = 0x02,
@@ -104,6 +235,12 @@ struct msi_claw_drvdata {
 
 	struct mutex read_data_mutex;
 	struct msi_claw_read_data *read_data;
+
+	/* M key remap support */
+	u16 bcd_device;
+	bool m_remap_supported;
+	const uint8_t (*m_remap_addr)[2];
+	uint8_t m_remap_code[MSI_CLAW_M_KEY_MAX];
 };
 
 static int msi_claw_write_cmd(struct hid_device *hdev, enum msi_claw_command_type cmdtype,
@@ -353,6 +490,104 @@ static int sync_to_rom(struct hid_device *hdev)
 	ret = 0;
 
 sync_to_rom_err:
+	return ret;
+}
+
+static bool msi_claw_fw_supports_m_remap(u16 bcd_device,
+	const uint8_t (**addr)[2])
+{
+	u8 major = bcd_device >> 8;
+
+	if (major == 1) {
+		*addr = (bcd_device >= 0x0166) ?
+			m_remap_addr_new : m_remap_addr_old;
+		return true;
+	}
+
+	if (major == 2 && bcd_device >= 0x0217) {
+		*addr = m_remap_addr_new;
+		return true;
+	}
+
+	if (major >= 3) {
+		*addr = m_remap_addr_new;
+		return true;
+	}
+
+	return false;
+}
+
+static int m_remap_name_to_code(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(m_remap_key_map); i++) {
+		if (!strcmp(name, m_remap_key_map[i].name))
+			return m_remap_key_map[i].code;
+	}
+
+	return -EINVAL;
+}
+
+static const char *m_remap_code_to_name(uint8_t code)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(m_remap_key_map); i++) {
+		if (m_remap_key_map[i].code == code)
+			return m_remap_key_map[i].name;
+	}
+
+	return NULL;
+}
+
+static int msi_claw_set_m_remap(struct hid_device *hdev,
+	enum msi_claw_m_key m_key, uint8_t code)
+{
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	const uint8_t cmd_buffer[] = {
+		0x01,
+		drvdata->m_remap_addr[m_key][0],
+		drvdata->m_remap_addr[m_key][1],
+		0x07, 0x04, 0x00,
+		code, 0xff, 0xff, 0xff, 0xff,
+	};
+	int ret;
+
+	if (!drvdata->control) {
+		hid_err(hdev, "hid-msi-claw couldn't find control interface\n");
+		ret = -ENODEV;
+		goto msi_claw_set_m_remap_err;
+	}
+
+	ret = msi_claw_write_cmd(hdev, MSI_CLAW_COMMAND_TYPE_WRITE_RGB_STATUS,
+		cmd_buffer, sizeof(cmd_buffer));
+	if (ret < 0) {
+		hid_err(hdev, "hid-msi-claw failed to set m_remap: %d\n", ret);
+		goto msi_claw_set_m_remap_err;
+	} else if (ret != MSI_CLAW_WRITE_SIZE) {
+		hid_err(hdev, "hid-msi-claw failed to write m_remap: %d\n", ret);
+		ret = -EIO;
+		goto msi_claw_set_m_remap_err;
+	}
+
+	ret = msi_claw_await_ack(hdev);
+	if (ret) {
+		hid_err(hdev, "hid-msi-claw failed to await ack for m_remap: %d\n", ret);
+		goto msi_claw_set_m_remap_err;
+	}
+
+	ret = sync_to_rom(hdev);
+	if (ret) {
+		hid_err(hdev, "hid-msi-claw failed to sync m_remap to rom: %d\n", ret);
+		goto msi_claw_set_m_remap_err;
+	}
+
+	drvdata->m_remap_code[m_key] = code;
+
+	return 0;
+
+msi_claw_set_m_remap_err:
 	return ret;
 }
 
@@ -679,6 +914,126 @@ static ssize_t mkeys_function_current_store(struct device *dev, struct device_at
 }
 static DEVICE_ATTR_RW(mkeys_function_current);
 
+static ssize_t m_remap_available_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	int i, ret = 0;
+	int len = ARRAY_SIZE(m_remap_key_map);
+
+	for (i = 0; i < len; i++) {
+		ret += sysfs_emit_at(buf, ret, "%s", m_remap_key_map[i].name);
+
+		if (i < len - 1)
+			ret += sysfs_emit_at(buf, ret, " ");
+	}
+	ret += sysfs_emit_at(buf, ret, "\n");
+
+	return ret;
+}
+static DEVICE_ATTR_RO(m_remap_available);
+
+static ssize_t m1_remap_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	const char *name;
+
+	if (!drvdata->m_remap_code[MSI_CLAW_M1_KEY])
+		return sysfs_emit(buf, "unknown\n");
+
+	name = m_remap_code_to_name(drvdata->m_remap_code[MSI_CLAW_M1_KEY]);
+	if (!name)
+		return sysfs_emit(buf, "unknown\n");
+
+	return sysfs_emit(buf, "%s\n", name);
+}
+
+static ssize_t m1_remap_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	char *input;
+	int code, ret;
+
+	if (!count)
+		return -EINVAL;
+
+	input = kmemdup(buf, count + 1, GFP_KERNEL);
+	if (!input)
+		return -ENOMEM;
+
+	input[count] = '\0';
+	if (input[count - 1] == '\n')
+		input[count - 1] = '\0';
+
+	code = m_remap_name_to_code(input);
+	kfree(input);
+
+	if (code < 0) {
+		hid_err(hdev, "hid-msi-claw invalid m_remap key\n");
+		return -EINVAL;
+	}
+
+	ret = msi_claw_set_m_remap(hdev, MSI_CLAW_M1_KEY, (uint8_t)code);
+	if (ret)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(m1_remap);
+
+static ssize_t m2_remap_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	const char *name;
+
+	if (!drvdata->m_remap_code[MSI_CLAW_M2_KEY])
+		return sysfs_emit(buf, "unknown\n");
+
+	name = m_remap_code_to_name(drvdata->m_remap_code[MSI_CLAW_M2_KEY]);
+	if (!name)
+		return sysfs_emit(buf, "unknown\n");
+
+	return sysfs_emit(buf, "%s\n", name);
+}
+
+static ssize_t m2_remap_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	char *input;
+	int code, ret;
+
+	if (!count)
+		return -EINVAL;
+
+	input = kmemdup(buf, count + 1, GFP_KERNEL);
+	if (!input)
+		return -ENOMEM;
+
+	input[count] = '\0';
+	if (input[count - 1] == '\n')
+		input[count - 1] = '\0';
+
+	code = m_remap_name_to_code(input);
+	kfree(input);
+
+	if (code < 0) {
+		hid_err(hdev, "hid-msi-claw invalid m_remap key\n");
+		return -EINVAL;
+	}
+
+	ret = msi_claw_set_m_remap(hdev, MSI_CLAW_M2_KEY, (uint8_t)code);
+	if (ret)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(m2_remap);
+
 static int __maybe_unused msi_claw_resume(struct hid_device *hdev)
 {
 	int ret;
@@ -747,6 +1102,20 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 		goto err_stop_hw;
 	}
 
+	/* Get firmware version for m_remap support */
+	{
+		struct usb_interface *intf = to_usb_interface(hdev->dev.parent);
+		struct usb_device *udev = interface_to_usbdev(intf);
+		drvdata->bcd_device = le16_to_cpu(udev->descriptor.bcdDevice);
+	}
+
+	drvdata->m_remap_supported = msi_claw_fw_supports_m_remap(
+		drvdata->bcd_device, &drvdata->m_remap_addr);
+
+	if (!drvdata->m_remap_supported)
+		hid_warn(hdev, "hid-msi-claw firmware 0x%04x not supported for m_remap\n",
+			drvdata->bcd_device);
+
 	if (hdev->rdesc[0] == MSI_CLAW_DEVICE_CONTROL_DESC) {
 		drvdata->control = devm_kzalloc(&hdev->dev, sizeof(*(drvdata->control)), GFP_KERNEL);
 		if (drvdata->control == NULL) {
@@ -787,10 +1156,36 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 			hid_err(hdev, "hid-msi-claw failed to sysfs_create_file dev_attr_reset: %d\n", ret);
 			goto err_dev_attr_reset;
 		}
+
+		if (drvdata->m_remap_supported) {
+			ret = sysfs_create_file(&hdev->dev.kobj, &dev_attr_m_remap_available.attr);
+			if (ret) {
+				hid_err(hdev, "hid-msi-claw failed to create m_remap_available: %d\n", ret);
+				goto err_m_remap_available;
+			}
+
+			ret = sysfs_create_file(&hdev->dev.kobj, &dev_attr_m1_remap.attr);
+			if (ret) {
+				hid_err(hdev, "hid-msi-claw failed to create m1_remap: %d\n", ret);
+				goto err_m1_remap;
+			}
+
+			ret = sysfs_create_file(&hdev->dev.kobj, &dev_attr_m2_remap.attr);
+			if (ret) {
+				hid_err(hdev, "hid-msi-claw failed to create m2_remap: %d\n", ret);
+				goto err_m2_remap;
+			}
+		}
 	}
 
 	return 0;
 
+err_m2_remap:
+	sysfs_remove_file(&hdev->dev.kobj, &dev_attr_m1_remap.attr);
+err_m1_remap:
+	sysfs_remove_file(&hdev->dev.kobj, &dev_attr_m_remap_available.attr);
+err_m_remap_available:
+	sysfs_remove_file(&hdev->dev.kobj, &dev_attr_reset.attr);
 err_dev_attr_gamepad_mode_current:
 	sysfs_remove_file(&hdev->dev.kobj, &dev_attr_gamepad_mode_available.attr);
 err_dev_attr_mkeys_function_available:
@@ -811,6 +1206,11 @@ static void msi_claw_remove(struct hid_device *hdev)
 	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
 
 	if (drvdata->control) {
+		if (drvdata->m_remap_supported) {
+			sysfs_remove_file(&hdev->dev.kobj, &dev_attr_m_remap_available.attr);
+			sysfs_remove_file(&hdev->dev.kobj, &dev_attr_m1_remap.attr);
+			sysfs_remove_file(&hdev->dev.kobj, &dev_attr_m2_remap.attr);
+		}
 		sysfs_remove_file(&hdev->dev.kobj, &dev_attr_gamepad_mode_available.attr);
 		sysfs_remove_file(&hdev->dev.kobj, &dev_attr_gamepad_mode_current.attr);
 		sysfs_remove_file(&hdev->dev.kobj, &dev_attr_mkeys_function_available.attr);
