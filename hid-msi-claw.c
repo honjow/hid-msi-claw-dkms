@@ -244,6 +244,8 @@ struct msi_claw_drvdata {
 	const uint8_t (*m_remap_addr)[2];
 };
 
+static void msi_claw_flush_queue(struct hid_device *hdev);
+
 static int msi_claw_write_cmd(struct hid_device *hdev, enum msi_claw_command_type cmdtype,
     const uint8_t *const buffer, size_t buffer_len)
 {
@@ -252,6 +254,8 @@ static int msi_claw_write_cmd(struct hid_device *hdev, enum msi_claw_command_typ
 	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
 	const uint8_t buf[MSI_CLAW_WRITE_SIZE] = {
 		MSI_CLAW_FEATURE_GAMEPAD_REPORT_ID, 0, 0, 0x3c, cmdtype };
+
+	msi_claw_flush_queue(hdev);
 
 	if (!drvdata->control) {
 		hid_err(hdev, "hid-msi-claw couldn't find control interface\n");
@@ -332,6 +336,24 @@ msi_claw_read_err:
 	}
 
 	return ret;
+}
+
+static void msi_claw_flush_queue(struct hid_device *hdev)
+{
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct msi_claw_read_data *event, *next;
+
+	scoped_guard(mutex, &drvdata->read_data_mutex) {
+		event = drvdata->read_data;
+		drvdata->read_data = NULL;
+
+		while (event) {
+			next = event->next;
+			kfree(event->data);
+			kfree(event);
+			event = next;
+		}
+	}
 }
 
 static int msi_claw_raw_event_control(struct hid_device *hdev, struct msi_claw_drvdata *drvdata,
@@ -428,32 +450,24 @@ static int msi_claw_await_ack(struct hid_device *hdev)
 
 	if (!drvdata->control) {
 		hid_err(hdev, "hid-msi-claw couldn't find control interface\n");
-		ret = -ENODEV;
-		goto msi_claw_await_ack_err;
+		return -ENODEV;
 	}
 
-	while (1) {
-		ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 1000);
-		if (ret < 0) {
-			hid_err(hdev, "hid-msi-claw failed to read ack: %d\n", ret);
-			goto msi_claw_await_ack_err;
-		} else if (ret != MSI_CLAW_READ_SIZE) {
-			hid_err(hdev, "hid-msi-claw invalid read: expected %d bytes, got %d\n", MSI_CLAW_READ_SIZE, ret);
-			ret = -EINVAL;
-			goto msi_claw_await_ack_err;
-		}
-
-		if (buffer[4] == (uint8_t)MSI_CLAW_COMMAND_TYPE_ACK)
-			break;
-
-		/* Skip non-ACK responses (e.g. from external tools) */
-		hid_notice(hdev, "hid-msi-claw skipping non-ACK response: 0x%02x\n", buffer[4]);
+	ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 1000);
+	if (ret < 0) {
+		hid_err(hdev, "hid-msi-claw failed to read ack: %d\n", ret);
+		return ret;
+	} else if (ret != MSI_CLAW_READ_SIZE) {
+		hid_err(hdev, "hid-msi-claw invalid read: expected %d bytes, got %d\n", MSI_CLAW_READ_SIZE, ret);
+		return -EINVAL;
 	}
 
-	ret = 0;
+	if (buffer[4] != (uint8_t)MSI_CLAW_COMMAND_TYPE_ACK) {
+		hid_err(hdev, "hid-msi-claw expected ACK (0x06), got 0x%02x\n", buffer[4]);
+		return -EINVAL;
+	}
 
-msi_claw_await_ack_err:
-	return ret;
+	return 0;
 }
 
 static int sync_to_rom(struct hid_device *hdev)
@@ -607,32 +621,28 @@ static int msi_claw_read_m_remap(struct hid_device *hdev,
 
 	if (!drvdata->control) {
 		hid_err(hdev, "hid-msi-claw couldn't find control interface\n");
-		ret = -ENODEV;
-		goto msi_claw_read_m_remap_err;
+		return -ENODEV;
 	}
 
 	ret = msi_claw_write_cmd(hdev, MSI_CLAW_COMMAND_TYPE_READ_PROFILE,
 		cmd_buffer, sizeof(cmd_buffer));
 	if (ret < 0) {
 		hid_err(hdev, "hid-msi-claw failed to send read m_remap request: %d\n", ret);
-		goto msi_claw_read_m_remap_err;
+		return ret;
 	} else if (ret != MSI_CLAW_WRITE_SIZE) {
 		hid_err(hdev, "hid-msi-claw couldn't send read m_remap request: %d\n", ret);
-		ret = -EIO;
-		goto msi_claw_read_m_remap_err;
+		return -EIO;
 	}
 
 	ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 50);
 	if (ret != MSI_CLAW_READ_SIZE) {
 		hid_err(hdev, "hid-msi-claw failed to read m_remap: %d\n", ret);
-		ret = -EINVAL;
-		goto msi_claw_read_m_remap_err;
+		return -EINVAL;
 	}
 
 	if (buffer[4] != (uint8_t)MSI_CLAW_COMMAND_TYPE_READ_PROFILE_ACK) {
-		hid_err(hdev, "hid-msi-claw received invalid response: expected 0x05, got 0x%02x\n", buffer[4]);
-		ret = -EINVAL;
-		goto msi_claw_read_m_remap_err;
+		hid_err(hdev, "hid-msi-claw expected READ_PROFILE_ACK (0x05), got 0x%02x\n", buffer[4]);
+		return -EINVAL;
 	}
 
 	/* Extract key codes, filtering out 0xff (disabled/empty) */
@@ -642,10 +652,7 @@ static int msi_claw_read_m_remap(struct hid_device *hdev,
 			codes[(*count)++] = buffer[11 + i];
 	}
 
-	ret = 0;
-
-msi_claw_read_m_remap_err:
-	return ret;
+	return 0;
 }
 
 static int msi_claw_reset_device(struct hid_device *hdev)
