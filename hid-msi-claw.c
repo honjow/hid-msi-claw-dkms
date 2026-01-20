@@ -593,6 +593,56 @@ msi_claw_set_m_remap_err:
 	return ret;
 }
 
+static int msi_claw_read_m_remap(struct hid_device *hdev,
+	enum msi_claw_m_key m_key, uint8_t *code)
+{
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	const uint8_t cmd_buffer[] = {
+		0x01,
+		drvdata->m_remap_addr[m_key][0],
+		drvdata->m_remap_addr[m_key][1],
+		0x07,
+	};
+	uint8_t buffer[MSI_CLAW_READ_SIZE] = {};
+	int ret;
+
+	if (!drvdata->control) {
+		hid_err(hdev, "hid-msi-claw couldn't find control interface\n");
+		ret = -ENODEV;
+		goto msi_claw_read_m_remap_err;
+	}
+
+	ret = msi_claw_write_cmd(hdev, MSI_CLAW_COMMAND_TYPE_READ_PROFILE,
+		cmd_buffer, sizeof(cmd_buffer));
+	if (ret < 0) {
+		hid_err(hdev, "hid-msi-claw failed to send read m_remap request: %d\n", ret);
+		goto msi_claw_read_m_remap_err;
+	} else if (ret != MSI_CLAW_WRITE_SIZE) {
+		hid_err(hdev, "hid-msi-claw couldn't send read m_remap request: %d\n", ret);
+		ret = -EIO;
+		goto msi_claw_read_m_remap_err;
+	}
+
+	ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 50);
+	if (ret != MSI_CLAW_READ_SIZE) {
+		hid_err(hdev, "hid-msi-claw failed to read m_remap: %d\n", ret);
+		ret = -EINVAL;
+		goto msi_claw_read_m_remap_err;
+	}
+
+	if (buffer[4] != (uint8_t)MSI_CLAW_COMMAND_TYPE_READ_PROFILE_ACK) {
+		hid_err(hdev, "hid-msi-claw received invalid response: expected 0x05, got 0x%02x\n", buffer[4]);
+		ret = -EINVAL;
+		goto msi_claw_read_m_remap_err;
+	}
+
+	*code = buffer[11];
+	ret = 0;
+
+msi_claw_read_m_remap_err:
+	return ret;
+}
+
 static int msi_claw_reset_device(struct hid_device *hdev)
 {
 	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -938,15 +988,17 @@ static ssize_t m1_remap_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
-	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	uint8_t code;
 	const char *name;
+	int ret;
 
-	if (!drvdata->m_remap_code[MSI_CLAW_M1_KEY])
-		return sysfs_emit(buf, "unknown\n");
+	ret = msi_claw_read_m_remap(hdev, MSI_CLAW_M1_KEY, &code);
+	if (ret)
+		return ret;
 
-	name = m_remap_code_to_name(drvdata->m_remap_code[MSI_CLAW_M1_KEY]);
+	name = m_remap_code_to_name(code);
 	if (!name)
-		return sysfs_emit(buf, "unknown\n");
+		return sysfs_emit(buf, "0x%02x\n", code);
 
 	return sysfs_emit(buf, "%s\n", name);
 }
@@ -989,15 +1041,17 @@ static ssize_t m2_remap_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
-	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	uint8_t code;
 	const char *name;
+	int ret;
 
-	if (!drvdata->m_remap_code[MSI_CLAW_M2_KEY])
-		return sysfs_emit(buf, "unknown\n");
+	ret = msi_claw_read_m_remap(hdev, MSI_CLAW_M2_KEY, &code);
+	if (ret)
+		return ret;
 
-	name = m_remap_code_to_name(drvdata->m_remap_code[MSI_CLAW_M2_KEY]);
+	name = m_remap_code_to_name(code);
 	if (!name)
-		return sysfs_emit(buf, "unknown\n");
+		return sysfs_emit(buf, "0x%02x\n", code);
 
 	return sysfs_emit(buf, "%s\n", name);
 }
