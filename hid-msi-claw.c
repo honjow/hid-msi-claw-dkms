@@ -55,6 +55,8 @@ static const char* mkeys_function_map[] =
 	"combination",
 };
 
+#define MSI_CLAW_M_REMAP_MAX_KEYS 5
+
 enum msi_claw_m_key {
 	MSI_CLAW_M1_KEY = 0,
 	MSI_CLAW_M2_KEY = 1,
@@ -240,7 +242,6 @@ struct msi_claw_drvdata {
 	u16 bcd_device;
 	bool m_remap_supported;
 	const uint8_t (*m_remap_addr)[2];
-	uint8_t m_remap_code[MSI_CLAW_M_KEY_MAX];
 };
 
 static int msi_claw_write_cmd(struct hid_device *hdev, enum msi_claw_command_type cmdtype,
@@ -544,7 +545,7 @@ static const char *m_remap_code_to_name(uint8_t code)
 }
 
 static int msi_claw_set_m_remap(struct hid_device *hdev,
-	enum msi_claw_m_key m_key, uint8_t code)
+	enum msi_claw_m_key m_key, const uint8_t *codes)
 {
 	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
 	const uint8_t cmd_buffer[] = {
@@ -552,7 +553,7 @@ static int msi_claw_set_m_remap(struct hid_device *hdev,
 		drvdata->m_remap_addr[m_key][0],
 		drvdata->m_remap_addr[m_key][1],
 		0x07, 0x04, 0x00,
-		code, 0xff, 0xff, 0xff, 0xff,
+		codes[0], codes[1], codes[2], codes[3], codes[4],
 	};
 	int ret;
 
@@ -585,8 +586,6 @@ static int msi_claw_set_m_remap(struct hid_device *hdev,
 		goto msi_claw_set_m_remap_err;
 	}
 
-	drvdata->m_remap_code[m_key] = code;
-
 	return 0;
 
 msi_claw_set_m_remap_err:
@@ -594,7 +593,7 @@ msi_claw_set_m_remap_err:
 }
 
 static int msi_claw_read_m_remap(struct hid_device *hdev,
-	enum msi_claw_m_key m_key, uint8_t *code)
+	enum msi_claw_m_key m_key, uint8_t *codes, int *count)
 {
 	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
 	const uint8_t cmd_buffer[] = {
@@ -604,7 +603,7 @@ static int msi_claw_read_m_remap(struct hid_device *hdev,
 		0x07,
 	};
 	uint8_t buffer[MSI_CLAW_READ_SIZE] = {};
-	int ret;
+	int ret, i;
 
 	if (!drvdata->control) {
 		hid_err(hdev, "hid-msi-claw couldn't find control interface\n");
@@ -636,7 +635,13 @@ static int msi_claw_read_m_remap(struct hid_device *hdev,
 		goto msi_claw_read_m_remap_err;
 	}
 
-	*code = buffer[11];
+	/* Extract key codes, filtering out 0xff (disabled/empty) */
+	*count = 0;
+	for (i = 0; i < MSI_CLAW_M_REMAP_MAX_KEYS; i++) {
+		if (buffer[11 + i] != 0xff)
+			codes[(*count)++] = buffer[11 + i];
+	}
+
 	ret = 0;
 
 msi_claw_read_m_remap_err:
@@ -988,27 +993,40 @@ static ssize_t m1_remap_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
-	uint8_t code;
+	uint8_t codes[MSI_CLAW_M_REMAP_MAX_KEYS];
 	const char *name;
-	int ret;
+	int key_count, ret, i;
+	ssize_t len = 0;
 
-	ret = msi_claw_read_m_remap(hdev, MSI_CLAW_M1_KEY, &code);
+	ret = msi_claw_read_m_remap(hdev, MSI_CLAW_M1_KEY, codes, &key_count);
 	if (ret)
 		return ret;
 
-	name = m_remap_code_to_name(code);
-	if (!name)
-		return sysfs_emit(buf, "0x%02x\n", code);
+	if (key_count == 0)
+		return sysfs_emit(buf, "disabled\n");
 
-	return sysfs_emit(buf, "%s\n", name);
+	for (i = 0; i < key_count; i++) {
+		name = m_remap_code_to_name(codes[i]);
+		if (name)
+			len += sysfs_emit_at(buf, len, "%s", name);
+		else
+			len += sysfs_emit_at(buf, len, "0x%02x", codes[i]);
+
+		if (i < key_count - 1)
+			len += sysfs_emit_at(buf, len, " ");
+	}
+	len += sysfs_emit_at(buf, len, "\n");
+
+	return len;
 }
 
 static ssize_t m1_remap_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
-	char *input;
-	int code, ret;
+	uint8_t codes[MSI_CLAW_M_REMAP_MAX_KEYS];
+	char *input, *token, *cur;
+	int code, ret, key_count = 0, i;
 
 	if (!count)
 		return -EINVAL;
@@ -1021,15 +1039,38 @@ static ssize_t m1_remap_store(struct device *dev,
 	if (input[count - 1] == '\n')
 		input[count - 1] = '\0';
 
-	code = m_remap_name_to_code(input);
+	/* Parse space-separated key names */
+	cur = input;
+	while ((token = strsep(&cur, " ")) != NULL) {
+		if (*token == '\0')
+			continue;
+
+		if (key_count >= MSI_CLAW_M_REMAP_MAX_KEYS) {
+			hid_err(hdev, "hid-msi-claw too many keys (max %d)\n",
+				MSI_CLAW_M_REMAP_MAX_KEYS);
+			kfree(input);
+			return -EINVAL;
+		}
+
+		code = m_remap_name_to_code(token);
+		if (code < 0) {
+			hid_err(hdev, "hid-msi-claw invalid key: %s\n", token);
+			kfree(input);
+			return -EINVAL;
+		}
+
+		codes[key_count++] = (uint8_t)code;
+	}
 	kfree(input);
 
-	if (code < 0) {
-		hid_err(hdev, "hid-msi-claw invalid m_remap key\n");
+	if (key_count == 0)
 		return -EINVAL;
-	}
 
-	ret = msi_claw_set_m_remap(hdev, MSI_CLAW_M1_KEY, (uint8_t)code);
+	/* Fill remaining slots with 0xff (disabled) */
+	for (i = key_count; i < MSI_CLAW_M_REMAP_MAX_KEYS; i++)
+		codes[i] = 0xff;
+
+	ret = msi_claw_set_m_remap(hdev, MSI_CLAW_M1_KEY, codes);
 	if (ret)
 		return ret;
 
@@ -1041,27 +1082,40 @@ static ssize_t m2_remap_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
-	uint8_t code;
+	uint8_t codes[MSI_CLAW_M_REMAP_MAX_KEYS];
 	const char *name;
-	int ret;
+	int key_count, ret, i;
+	ssize_t len = 0;
 
-	ret = msi_claw_read_m_remap(hdev, MSI_CLAW_M2_KEY, &code);
+	ret = msi_claw_read_m_remap(hdev, MSI_CLAW_M2_KEY, codes, &key_count);
 	if (ret)
 		return ret;
 
-	name = m_remap_code_to_name(code);
-	if (!name)
-		return sysfs_emit(buf, "0x%02x\n", code);
+	if (key_count == 0)
+		return sysfs_emit(buf, "disabled\n");
 
-	return sysfs_emit(buf, "%s\n", name);
+	for (i = 0; i < key_count; i++) {
+		name = m_remap_code_to_name(codes[i]);
+		if (name)
+			len += sysfs_emit_at(buf, len, "%s", name);
+		else
+			len += sysfs_emit_at(buf, len, "0x%02x", codes[i]);
+
+		if (i < key_count - 1)
+			len += sysfs_emit_at(buf, len, " ");
+	}
+	len += sysfs_emit_at(buf, len, "\n");
+
+	return len;
 }
 
 static ssize_t m2_remap_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
-	char *input;
-	int code, ret;
+	uint8_t codes[MSI_CLAW_M_REMAP_MAX_KEYS];
+	char *input, *token, *cur;
+	int code, ret, key_count = 0, i;
 
 	if (!count)
 		return -EINVAL;
@@ -1074,15 +1128,38 @@ static ssize_t m2_remap_store(struct device *dev,
 	if (input[count - 1] == '\n')
 		input[count - 1] = '\0';
 
-	code = m_remap_name_to_code(input);
+	/* Parse space-separated key names */
+	cur = input;
+	while ((token = strsep(&cur, " ")) != NULL) {
+		if (*token == '\0')
+			continue;
+
+		if (key_count >= MSI_CLAW_M_REMAP_MAX_KEYS) {
+			hid_err(hdev, "hid-msi-claw too many keys (max %d)\n",
+				MSI_CLAW_M_REMAP_MAX_KEYS);
+			kfree(input);
+			return -EINVAL;
+		}
+
+		code = m_remap_name_to_code(token);
+		if (code < 0) {
+			hid_err(hdev, "hid-msi-claw invalid key: %s\n", token);
+			kfree(input);
+			return -EINVAL;
+		}
+
+		codes[key_count++] = (uint8_t)code;
+	}
 	kfree(input);
 
-	if (code < 0) {
-		hid_err(hdev, "hid-msi-claw invalid m_remap key\n");
+	if (key_count == 0)
 		return -EINVAL;
-	}
 
-	ret = msi_claw_set_m_remap(hdev, MSI_CLAW_M2_KEY, (uint8_t)code);
+	/* Fill remaining slots with 0xff (disabled) */
+	for (i = key_count; i < MSI_CLAW_M_REMAP_MAX_KEYS; i++)
+		codes[i] = 0xff;
+
+	ret = msi_claw_set_m_remap(hdev, MSI_CLAW_M2_KEY, codes);
 	if (ret)
 		return ret;
 
