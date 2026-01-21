@@ -3,6 +3,8 @@
 #include <linux/module.h>
 #include <linux/usb.h>
 #include <linux/mutex.h>
+#include <linux/leds.h>
+#include <linux/led-class-multicolor.h>
 
 //#include "hid-ids.h"
 
@@ -13,6 +15,59 @@
 
 #define MSI_CLAW_GAME_CONTROL_DESC   0x05
 #define MSI_CLAW_DEVICE_CONTROL_DESC 0x06
+
+/* LED constants */
+#define MSI_CLAW_LED_ZONES 9
+#define MSI_CLAW_LED_MAX_FRAMES 8
+#define MSI_CLAW_LED_NAME "msi_claw:rgb:joystick_rings"
+
+enum msi_claw_led_effect {
+	MSI_CLAW_LED_EFFECT_MONOCOLOR = 0,
+	MSI_CLAW_LED_EFFECT_BREATHE,
+	MSI_CLAW_LED_EFFECT_CHROMA,
+	MSI_CLAW_LED_EFFECT_RAINBOW,
+	MSI_CLAW_LED_EFFECT_CUSTOM,
+
+	MSI_CLAW_LED_EFFECT_MAX,
+};
+
+static const char * const led_effect_names[] = {
+	[MSI_CLAW_LED_EFFECT_MONOCOLOR] = "monocolor",
+	[MSI_CLAW_LED_EFFECT_BREATHE] = "breathe",
+	[MSI_CLAW_LED_EFFECT_CHROMA] = "chroma",
+	[MSI_CLAW_LED_EFFECT_RAINBOW] = "rainbow",
+	[MSI_CLAW_LED_EFFECT_CUSTOM] = "custom",
+};
+
+struct msi_claw_rgb_frame {
+	u8 zones[MSI_CLAW_LED_ZONES][3];  /* 9 zones * RGB */
+};
+
+struct msi_claw_rgb_config {
+	u8 frame_count;   /* 1-8 */
+	u8 speed;         /* 0-20 (0=fastest) */
+	u8 brightness;    /* 0-100 */
+	struct msi_claw_rgb_frame frames[MSI_CLAW_LED_MAX_FRAMES];
+};
+
+struct msi_claw_led {
+	struct led_classdev_mc mc_cdev;
+	struct mc_subled subled_info[3];
+	struct hid_device *hdev;
+
+	/* State */
+	bool enabled;
+	enum msi_claw_led_effect effect;
+	u8 speed;          /* 0-100 (user value, mapped to 0-20 for device) */
+	u8 brightness;     /* 0-100 */
+
+	/* Monocolor effect color (from multi_intensity) */
+	u8 color[3];
+
+	/* Custom effect keyframes cache */
+	u8 custom_frame_count;
+	u8 custom_frames[MSI_CLAW_LED_MAX_FRAMES][MSI_CLAW_LED_ZONES][3];
+};
 
 enum msi_claw_gamepad_mode {
 	MSI_CLAW_GAMEPAD_MODE_OFFLINE = 0x00,
@@ -188,6 +243,10 @@ static const uint8_t m_remap_addr_new[MSI_CLAW_M_KEY_MAX][2] = {
 	{0x01, 0x64},  /* M2 */
 };
 
+/* RGB LED addresses (firmware version dependent) */
+static const uint8_t rgb_addr_old[2] = {0x01, 0xfa};
+static const uint8_t rgb_addr_new[2] = {0x02, 0x4a};
+
 enum msi_claw_command_type {
 	MSI_CLAW_COMMAND_TYPE_ENTER_PROFILE_CONFIG = 0x01,
 	MSI_CLAW_COMMAND_TYPE_EXIT_PROFILE_CONFIG = 0x02,
@@ -242,6 +301,10 @@ struct msi_claw_drvdata {
 	u16 bcd_device;
 	bool m_remap_supported;
 	const uint8_t (*m_remap_addr)[2];
+
+	/* RGB LED support */
+	struct msi_claw_led *led;
+	const uint8_t *rgb_addr;
 };
 
 static void msi_claw_flush_queue(struct hid_device *hdev);
@@ -502,6 +565,774 @@ static int sync_to_rom(struct hid_device *hdev)
 sync_to_rom_err:
 	return ret;
 }
+
+/* ========== RGB LED Functions ========== */
+
+/*
+ * Convert HSV to RGB
+ * h: 0-359, s: 0-255, v: 0-255
+ */
+static void msi_claw_hsv_to_rgb(u16 h, u8 s, u8 v, u8 *r, u8 *g, u8 *b)
+{
+	u8 region, remainder, p, q, t;
+
+	if (s == 0) {
+		*r = *g = *b = v;
+		return;
+	}
+
+	region = h / 60;
+	remainder = (h - (region * 60)) * 255 / 60;
+
+	p = (v * (255 - s)) >> 8;
+	q = (v * (255 - ((s * remainder) >> 8))) >> 8;
+	t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8;
+
+	switch (region) {
+	case 0:
+		*r = v; *g = t; *b = p;
+		break;
+	case 1:
+		*r = q; *g = v; *b = p;
+		break;
+	case 2:
+		*r = p; *g = v; *b = t;
+		break;
+	case 3:
+		*r = p; *g = q; *b = v;
+		break;
+	case 4:
+		*r = t; *g = p; *b = v;
+		break;
+	default:
+		*r = v; *g = p; *b = q;
+		break;
+	}
+}
+
+/* Fill all zones with the same color */
+static void msi_claw_frame_fill_solid(struct msi_claw_rgb_frame *frame,
+				       u8 r, u8 g, u8 b)
+{
+	int i;
+
+	for (i = 0; i < MSI_CLAW_LED_ZONES; i++) {
+		frame->zones[i][0] = r;
+		frame->zones[i][1] = g;
+		frame->zones[i][2] = b;
+	}
+}
+
+/* Send RGB configuration to device */
+static int msi_claw_send_rgb_config(struct hid_device *hdev,
+				     struct msi_claw_rgb_config *cfg)
+{
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	u8 cmd_buffer[55];  /* Max data per packet */
+	int ret, frame, offset, chunk_size;
+	u16 base_addr, current_addr;
+	u8 *data;
+	int data_size;
+
+	if (!drvdata->control) {
+		hid_err(hdev, "hid-msi-claw LED: no control interface\n");
+		return -ENODEV;
+	}
+
+	if (!drvdata->rgb_addr) {
+		hid_err(hdev, "hid-msi-claw LED: no RGB address\n");
+		return -ENODEV;
+	}
+
+	/* Build complete RGB data */
+	/* Header: 5 bytes + frames * 27 bytes */
+	data_size = 5 + cfg->frame_count * 27;
+	data = kzalloc(data_size, GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	/* Header */
+	data[0] = 0;  /* index */
+	data[1] = cfg->frame_count;
+	data[2] = 0x09;  /* effect type */
+	data[3] = cfg->speed;  /* Device speed 0-20, 0=fastest */
+	data[4] = cfg->brightness;
+
+	/* Keyframes */
+	for (frame = 0; frame < cfg->frame_count; frame++) {
+		u8 *frame_data = &data[5 + frame * 27];
+		int zone;
+
+		for (zone = 0; zone < MSI_CLAW_LED_ZONES; zone++) {
+			frame_data[zone * 3 + 0] = cfg->frames[frame].zones[zone][0];
+			frame_data[zone * 3 + 1] = cfg->frames[frame].zones[zone][1];
+			frame_data[zone * 3 + 2] = cfg->frames[frame].zones[zone][2];
+		}
+	}
+
+	/* Calculate base address */
+	base_addr = (drvdata->rgb_addr[0] << 8) | drvdata->rgb_addr[1];
+
+	/* Send data in chunks (max 55 bytes per packet) */
+	offset = 0;
+	while (offset < data_size) {
+		chunk_size = min(55, data_size - offset);
+		current_addr = base_addr + offset;
+
+		/* Build command buffer */
+		cmd_buffer[0] = 0x01;  /* profile */
+		cmd_buffer[1] = (current_addr >> 8) & 0xff;
+		cmd_buffer[2] = current_addr & 0xff;
+		cmd_buffer[3] = chunk_size;
+		memcpy(&cmd_buffer[4], &data[offset], chunk_size);
+
+		ret = msi_claw_write_cmd(hdev, MSI_CLAW_COMMAND_TYPE_WRITE_PROFILE_DATA,
+					  cmd_buffer, 4 + chunk_size);
+		if (ret < 0) {
+			hid_err(hdev, "hid-msi-claw LED: failed to send RGB data: %d\n", ret);
+			goto out;
+		}
+
+		ret = msi_claw_await_ack(hdev);
+		if (ret) {
+			hid_err(hdev, "hid-msi-claw LED: failed to await ack: %d\n", ret);
+			goto out;
+		}
+
+		offset += chunk_size;
+	}
+
+	ret = 0;
+
+out:
+	kfree(data);
+	return ret;
+}
+
+/*
+ * Speed conversion helpers
+ * User speed: 0-100 (100 = fastest)
+ * Device speed: 0-20 (0 = fastest, acts like frame interval)
+ */
+
+/* Convert user speed (0-100) to device speed (0-20), no compensation */
+static inline u8 msi_claw_speed_to_device(u8 user_speed)
+{
+	return (100 - user_speed) * 20 / 100;
+}
+
+/*
+ * Convert with compensation for multi-frame effects
+ * Limits the slowest speed to avoid overly slow animations
+ * min_speed: minimum device speed (fastest limit)
+ * max_speed: maximum device speed (slowest limit, < 20)
+ */
+static inline u8 msi_claw_speed_to_device_compensated(u8 user_speed,
+						       u8 min_speed, u8 max_speed)
+{
+	u8 base = msi_claw_speed_to_device(user_speed);
+
+	/* Clamp to [min_speed, max_speed] range */
+	if (base < min_speed)
+		return min_speed;
+	if (base > max_speed)
+		return max_speed;
+	return base;
+}
+
+/* Build solid effect (1 frame, all zones same color) */
+static void msi_claw_build_monocolor(struct msi_claw_rgb_config *cfg,
+				      struct msi_claw_led *led)
+{
+	cfg->frame_count = 1;
+	cfg->speed = 0;  /* Static effect, speed doesn't matter */
+	cfg->brightness = led->brightness;
+
+	msi_claw_frame_fill_solid(&cfg->frames[0],
+				   led->color[0], led->color[1], led->color[2]);
+}
+
+/* Build breathe effect (2 frames: color -> black) */
+static void msi_claw_build_breathe(struct msi_claw_rgb_config *cfg,
+				    struct msi_claw_led *led)
+{
+	cfg->frame_count = 2;
+	/* 2 frames: slight compensation, limit slowest to 15 */
+	cfg->speed = msi_claw_speed_to_device_compensated(led->speed, 0, 15);
+	cfg->brightness = led->brightness;
+
+	/* Frame 0: main color */
+	msi_claw_frame_fill_solid(&cfg->frames[0],
+				   led->color[0], led->color[1], led->color[2]);
+	/* Frame 1: black */
+	msi_claw_frame_fill_solid(&cfg->frames[1], 0, 0, 0);
+}
+
+/* Build chroma effect (6 frames: rainbow cycle, all zones sync) */
+static void msi_claw_build_chroma(struct msi_claw_rgb_config *cfg,
+				   struct msi_claw_led *led)
+{
+	static const u16 hues[] = {0, 60, 120, 180, 240, 300};
+	int i;
+	u8 r, g, b;
+
+	cfg->frame_count = 6;
+	/* 6 frames: stronger compensation, limit slowest to 10 */
+	cfg->speed = msi_claw_speed_to_device_compensated(led->speed, 0, 10);
+	cfg->brightness = led->brightness;
+
+	for (i = 0; i < 6; i++) {
+		msi_claw_hsv_to_rgb(hues[i], 255, 255, &r, &g, &b);
+		msi_claw_frame_fill_solid(&cfg->frames[i], r, g, b);
+	}
+}
+
+/* Build rainbow effect (4 frames: rotating colors around joysticks) */
+static void msi_claw_build_rainbow(struct msi_claw_rgb_config *cfg,
+				    struct msi_claw_led *led)
+{
+	static const u16 base_hues[] = {0, 90, 180, 270};
+	int frame, zone;
+	u8 r, g, b;
+	u16 hue;
+
+	cfg->frame_count = 4;
+	/* 4 frames: moderate compensation, limit slowest to 12 */
+	cfg->speed = msi_claw_speed_to_device_compensated(led->speed, 0, 12);
+	cfg->brightness = led->brightness;
+
+	for (frame = 0; frame < 4; frame++) {
+		/* Right joystick (zones 0-3): rotate */
+		for (zone = 0; zone < 4; zone++) {
+			hue = base_hues[(zone + frame) % 4];
+			msi_claw_hsv_to_rgb(hue, 255, 255, &r, &g, &b);
+			cfg->frames[frame].zones[zone][0] = r;
+			cfg->frames[frame].zones[zone][1] = g;
+			cfg->frames[frame].zones[zone][2] = b;
+		}
+		/* Left joystick (zones 4-7): rotate */
+		for (zone = 0; zone < 4; zone++) {
+			hue = base_hues[(zone + frame) % 4];
+			msi_claw_hsv_to_rgb(hue, 255, 255, &r, &g, &b);
+			cfg->frames[frame].zones[zone + 4][0] = r;
+			cfg->frames[frame].zones[zone + 4][1] = g;
+			cfg->frames[frame].zones[zone + 4][2] = b;
+		}
+		/* ABXY (zone 8): cycle */
+		hue = base_hues[frame];
+		msi_claw_hsv_to_rgb(hue, 255, 255, &r, &g, &b);
+		cfg->frames[frame].zones[8][0] = r;
+		cfg->frames[frame].zones[8][1] = g;
+		cfg->frames[frame].zones[8][2] = b;
+	}
+}
+
+/* Build custom effect from cached keyframes */
+static void msi_claw_build_custom(struct msi_claw_rgb_config *cfg,
+				   struct msi_claw_led *led)
+{
+	int frame, zone;
+
+	cfg->frame_count = led->custom_frame_count;
+	/* Custom: direct conversion, no compensation (user controls frame count) */
+	cfg->speed = msi_claw_speed_to_device(led->speed);
+	cfg->brightness = led->brightness;
+
+	for (frame = 0; frame < led->custom_frame_count; frame++) {
+		for (zone = 0; zone < MSI_CLAW_LED_ZONES; zone++) {
+			cfg->frames[frame].zones[zone][0] = led->custom_frames[frame][zone][0];
+			cfg->frames[frame].zones[zone][1] = led->custom_frames[frame][zone][1];
+			cfg->frames[frame].zones[zone][2] = led->custom_frames[frame][zone][2];
+		}
+	}
+}
+
+/* Apply current effect to device */
+static int msi_claw_apply_effect(struct msi_claw_led *led)
+{
+	struct msi_claw_rgb_config cfg = {};
+
+	if (!led->enabled) {
+		/* Send black frame with brightness 0 */
+		cfg.frame_count = 1;
+		cfg.speed = 0;
+		cfg.brightness = 0;
+		msi_claw_frame_fill_solid(&cfg.frames[0], 0, 0, 0);
+		return msi_claw_send_rgb_config(led->hdev, &cfg);
+	}
+
+	switch (led->effect) {
+	case MSI_CLAW_LED_EFFECT_MONOCOLOR:
+		msi_claw_build_monocolor(&cfg, led);
+		break;
+	case MSI_CLAW_LED_EFFECT_BREATHE:
+		msi_claw_build_breathe(&cfg, led);
+		break;
+	case MSI_CLAW_LED_EFFECT_CHROMA:
+		msi_claw_build_chroma(&cfg, led);
+		break;
+	case MSI_CLAW_LED_EFFECT_RAINBOW:
+		msi_claw_build_rainbow(&cfg, led);
+		break;
+	case MSI_CLAW_LED_EFFECT_CUSTOM:
+		if (led->custom_frame_count == 0) {
+			hid_warn(led->hdev, "hid-msi-claw LED: no custom keyframes\n");
+			return -EINVAL;
+		}
+		msi_claw_build_custom(&cfg, led);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return msi_claw_send_rgb_config(led->hdev, &cfg);
+}
+
+/* ========== LED sysfs attributes ========== */
+
+/* Helper to get msi_claw_led from LED device */
+static inline struct msi_claw_led *dev_to_msi_claw_led(struct device *dev)
+{
+	struct led_classdev *led_cdev = dev_get_drvdata(dev);
+	struct led_classdev_mc *mc_cdev = lcdev_to_mccdev(led_cdev);
+
+	return container_of(mc_cdev, struct msi_claw_led, mc_cdev);
+}
+
+static ssize_t enabled_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+
+	return sysfs_emit(buf, "%s\n", led->enabled ? "true" : "false");
+}
+
+static ssize_t enabled_store(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	bool val;
+	int ret;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	if (val == led->enabled)
+		return count;
+
+	led->enabled = val;
+	ret = msi_claw_apply_effect(led);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(enabled);
+
+static ssize_t enabled_index_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+
+	return sysfs_emit(buf, "%s\n", led->enabled ? "true" : "false");
+}
+
+static ssize_t enabled_index_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	bool val;
+	int ret;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	if (val == led->enabled)
+		return count;
+
+	led->enabled = val;
+	ret = msi_claw_apply_effect(led);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(enabled_index);
+
+static ssize_t effect_show(struct device *dev,
+			   struct device_attribute *attr, char *buf)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+
+	if (led->effect >= MSI_CLAW_LED_EFFECT_MAX)
+		return -EINVAL;
+
+	return sysfs_emit(buf, "%s\n", led_effect_names[led->effect]);
+}
+
+static ssize_t effect_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	int i, ret;
+	char effect_name[16];
+
+	if (sscanf(buf, "%15s", effect_name) != 1)
+		return -EINVAL;
+
+	for (i = 0; i < MSI_CLAW_LED_EFFECT_MAX; i++) {
+		if (strcmp(effect_name, led_effect_names[i]) == 0) {
+			led->effect = i;
+			ret = msi_claw_apply_effect(led);
+			return ret ? ret : count;
+		}
+	}
+
+	return -EINVAL;
+}
+static DEVICE_ATTR_RW(effect);
+
+static ssize_t effect_index_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+
+	if (led->effect >= MSI_CLAW_LED_EFFECT_MAX)
+		return -EINVAL;
+
+	return sysfs_emit(buf, "%s\n", led_effect_names[led->effect]);
+}
+
+static ssize_t effect_index_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	int i, ret;
+	char effect_name[16];
+
+	if (sscanf(buf, "%15s", effect_name) != 1)
+		return -EINVAL;
+
+	for (i = 0; i < MSI_CLAW_LED_EFFECT_MAX; i++) {
+		if (strcmp(effect_name, led_effect_names[i]) == 0) {
+			led->effect = i;
+			ret = msi_claw_apply_effect(led);
+			return ret ? ret : count;
+		}
+	}
+
+	return -EINVAL;
+}
+static DEVICE_ATTR_RW(effect_index);
+
+static ssize_t speed_show(struct device *dev,
+			  struct device_attribute *attr, char *buf)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+
+	return sysfs_emit(buf, "%d\n", led->speed);
+}
+
+static ssize_t speed_store(struct device *dev,
+			   struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	if (val > 100)
+		return -EINVAL;
+
+	led->speed = val;
+
+	/* Apply if not monocolor effect (monocolor doesn't use speed) */
+	if (led->effect != MSI_CLAW_LED_EFFECT_MONOCOLOR && led->enabled) {
+		ret = msi_claw_apply_effect(led);
+		if (ret)
+			return ret;
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(speed);
+
+static ssize_t speed_range_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0-100\n");
+}
+static DEVICE_ATTR_RO(speed_range);
+
+static ssize_t keyframes_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	int frame, zone, len = 0;
+
+	if (led->custom_frame_count == 0)
+		return sysfs_emit(buf, "(not set)\n");
+
+	for (frame = 0; frame < led->custom_frame_count; frame++) {
+		if (frame > 0)
+			len += sysfs_emit_at(buf, len, " ");
+		for (zone = 0; zone < MSI_CLAW_LED_ZONES; zone++) {
+			len += sysfs_emit_at(buf, len, "%d,%d,%d%s",
+					     led->custom_frames[frame][zone][0],
+					     led->custom_frames[frame][zone][1],
+					     led->custom_frames[frame][zone][2],
+					     (zone < MSI_CLAW_LED_ZONES - 1) ? ";" : "");
+		}
+	}
+	len += sysfs_emit_at(buf, len, "\n");
+
+	return len;
+}
+
+static ssize_t keyframes_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	u8 frames[MSI_CLAW_LED_MAX_FRAMES][MSI_CLAW_LED_ZONES][3];
+	const char *p = buf;
+	int frame, zone, ret;
+	unsigned int r, g, b;
+	int frame_count = 0;
+
+	/* Count frames by counting spaces + 1 */
+	for (const char *s = buf; *s; s++) {
+		if (*s == ' ')
+			frame_count++;
+	}
+	frame_count++;  /* frames = spaces + 1 */
+
+	if (frame_count < 1 || frame_count > MSI_CLAW_LED_MAX_FRAMES)
+		return -EINVAL;
+
+	/* Parse frame data: frame1 frame2 ... (space-separated) */
+	/* Each frame: R,G,B;R,G,B;...;R,G,B (9 zones, semicolon-separated) */
+	for (frame = 0; frame < frame_count; frame++) {
+		/* Skip leading spaces */
+		while (*p == ' ')
+			p++;
+
+		for (zone = 0; zone < MSI_CLAW_LED_ZONES; zone++) {
+			if (sscanf(p, "%u,%u,%u", &r, &g, &b) != 3)
+				return -EINVAL;
+
+			if (r > 255 || g > 255 || b > 255)
+				return -EINVAL;
+
+			frames[frame][zone][0] = r;
+			frames[frame][zone][1] = g;
+			frames[frame][zone][2] = b;
+
+			/* Move past this zone's data */
+			while (*p && *p != ';' && *p != ' ' && *p != '\n')
+				p++;
+
+			if (zone < MSI_CLAW_LED_ZONES - 1) {
+				/* Expect semicolon between zones */
+				if (*p != ';')
+					return -EINVAL;
+				p++;
+			}
+		}
+
+		/* Move to next frame (skip to space or end) */
+		while (*p && *p != ' ' && *p != '\n')
+			p++;
+	}
+
+	/* Store in cache */
+	led->custom_frame_count = frame_count;
+	memcpy(led->custom_frames, frames, frame_count * sizeof(frames[0]));
+
+	/* Apply if custom effect is active */
+	if (led->effect == MSI_CLAW_LED_EFFECT_CUSTOM && led->enabled) {
+		ret = msi_claw_apply_effect(led);
+		if (ret)
+			return ret;
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(keyframes);
+
+/* ========== End LED sysfs attributes ========== */
+
+/* LED multicolor brightness callback */
+static int msi_claw_led_brightness_set(struct led_classdev *cdev,
+				       enum led_brightness brightness)
+{
+	struct led_classdev_mc *mc = lcdev_to_mccdev(cdev);
+	struct msi_claw_led *led = container_of(mc, struct msi_claw_led, mc_cdev);
+
+	/* Calculate RGB from multi_intensity and brightness */
+	led_mc_calc_color_components(mc, brightness);
+
+	/* Store color values (scaled by brightness) */
+	led->color[0] = mc->subled_info[0].brightness;
+	led->color[1] = mc->subled_info[1].brightness;
+	led->color[2] = mc->subled_info[2].brightness;
+
+	/* Store brightness directly (0-100) */
+	led->brightness = brightness;
+
+	/* Apply if monocolor effect and enabled */
+	if (led->effect == MSI_CLAW_LED_EFFECT_MONOCOLOR && led->enabled)
+		return msi_claw_apply_effect(led);
+
+	return 0;
+}
+
+/* Determine RGB address based on firmware version */
+static const uint8_t *msi_claw_get_rgb_addr(u16 bcd_device)
+{
+	u8 major = bcd_device >> 8;
+
+	if (major == 1)
+		return (bcd_device >= 0x0166) ? rgb_addr_new : rgb_addr_old;
+	if (major == 2)
+		return (bcd_device >= 0x0217) ? rgb_addr_new : rgb_addr_old;
+	if (major >= 3)
+		return rgb_addr_new;
+
+	return rgb_addr_old;
+}
+
+/* Initialize and register LED device */
+static int msi_claw_led_init(struct hid_device *hdev)
+{
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct msi_claw_led *led;
+	int ret;
+
+	led = devm_kzalloc(&hdev->dev, sizeof(*led), GFP_KERNEL);
+	if (!led)
+		return -ENOMEM;
+
+	led->hdev = hdev;
+	led->enabled = true;
+	led->effect = MSI_CLAW_LED_EFFECT_MONOCOLOR;
+	led->speed = 10;
+	led->brightness = 100;
+	led->color[0] = 255;
+	led->color[1] = 255;
+	led->color[2] = 255;
+
+	/* Setup multicolor LED */
+	led->subled_info[0].color_index = LED_COLOR_ID_RED;
+	led->subled_info[0].intensity = 255;
+	led->subled_info[1].color_index = LED_COLOR_ID_GREEN;
+	led->subled_info[1].intensity = 255;
+	led->subled_info[2].color_index = LED_COLOR_ID_BLUE;
+	led->subled_info[2].intensity = 255;
+
+	led->mc_cdev.led_cdev.name = MSI_CLAW_LED_NAME;
+	led->mc_cdev.led_cdev.brightness = 100;
+	led->mc_cdev.led_cdev.max_brightness = 100;
+	led->mc_cdev.led_cdev.brightness_set_blocking = msi_claw_led_brightness_set;
+	led->mc_cdev.num_colors = 3;
+	led->mc_cdev.subled_info = led->subled_info;
+
+	ret = devm_led_classdev_multicolor_register(&hdev->dev, &led->mc_cdev);
+	if (ret) {
+		hid_err(hdev, "hid-msi-claw: failed to register LED: %d\n", ret);
+		return ret;
+	}
+
+	/* Create custom sysfs attributes on LED device */
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_enabled.attr);
+	if (ret)
+		goto err_enabled;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_enabled_index.attr);
+	if (ret)
+		goto err_enabled_index;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_effect.attr);
+	if (ret)
+		goto err_effect;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_effect_index.attr);
+	if (ret)
+		goto err_effect_index;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_speed.attr);
+	if (ret)
+		goto err_speed;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_speed_range.attr);
+	if (ret)
+		goto err_speed_range;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_keyframes.attr);
+	if (ret)
+		goto err_keyframes;
+
+	drvdata->led = led;
+	drvdata->rgb_addr = msi_claw_get_rgb_addr(drvdata->bcd_device);
+
+	hid_info(hdev, "hid-msi-claw: LED initialized (rgb_addr: 0x%02x%02x)\n",
+		 drvdata->rgb_addr[0], drvdata->rgb_addr[1]);
+
+	return 0;
+
+err_keyframes:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_speed_range.attr);
+err_speed_range:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_speed.attr);
+err_speed:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_effect_index.attr);
+err_effect_index:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_effect.attr);
+err_effect:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_enabled_index.attr);
+err_enabled_index:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_enabled.attr);
+err_enabled:
+	return ret;
+}
+
+/* Cleanup LED device */
+static void msi_claw_led_exit(struct hid_device *hdev)
+{
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	struct kobject *kobj;
+
+	if (!drvdata->led)
+		return;
+
+	kobj = &drvdata->led->mc_cdev.led_cdev.dev->kobj;
+
+	sysfs_remove_file(kobj, &dev_attr_keyframes.attr);
+	sysfs_remove_file(kobj, &dev_attr_speed_range.attr);
+	sysfs_remove_file(kobj, &dev_attr_speed.attr);
+	sysfs_remove_file(kobj, &dev_attr_effect_index.attr);
+	sysfs_remove_file(kobj, &dev_attr_effect.attr);
+	sysfs_remove_file(kobj, &dev_attr_enabled_index.attr);
+	sysfs_remove_file(kobj, &dev_attr_enabled.attr);
+
+	/* LED classdev is devm-managed, no need to unregister */
+	drvdata->led = NULL;
+}
+
+/* ========== End LED registration ========== */
 
 static bool msi_claw_fw_supports_m_remap(u16 bcd_device,
 	const uint8_t (**addr)[2])
@@ -1302,6 +2133,13 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 				goto err_m2_remap;
 			}
 		}
+
+		/* Initialize RGB LED */
+		ret = msi_claw_led_init(hdev);
+		if (ret) {
+			hid_warn(hdev, "hid-msi-claw: LED init failed: %d (continuing)\n", ret);
+			/* LED failure is not fatal, continue */
+		}
 	}
 
 	return 0;
@@ -1332,6 +2170,9 @@ static void msi_claw_remove(struct hid_device *hdev)
 	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
 
 	if (drvdata->control) {
+		/* Cleanup LED */
+		msi_claw_led_exit(hdev);
+
 		if (drvdata->m_remap_supported) {
 			sysfs_remove_file(&hdev->dev.kobj, &dev_attr_m_remap_available.attr);
 			sysfs_remove_file(&hdev->dev.kobj, &dev_attr_m1_remap.attr);
