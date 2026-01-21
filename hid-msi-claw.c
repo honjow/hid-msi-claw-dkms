@@ -57,6 +57,7 @@ struct msi_claw_led {
 
 	/* State */
 	bool enabled;
+	bool config_loaded;  /* true if speed/brightness read from device */
 	enum msi_claw_led_effect effect;
 	u8 speed;          /* 0-100 (user value, mapped to 0-20 for device) */
 	u8 brightness;     /* 0-100 */
@@ -775,6 +776,24 @@ static int msi_claw_read_rgb_config(struct hid_device *hdev,
 	return 0;
 }
 
+/* Lazy load config from device on first access */
+static void msi_claw_led_lazy_load(struct msi_claw_led *led)
+{
+	if (led->config_loaded)
+		return;
+
+	led->config_loaded = true;
+
+	if (msi_claw_read_rgb_config(led->hdev, &led->speed, &led->brightness) < 0) {
+		hid_warn(led->hdev, "hid-msi-claw LED: lazy load failed, using defaults\n");
+		led->speed = 50;
+		led->brightness = 100;
+	}
+
+	/* Sync brightness to LED class device */
+	led->mc_cdev.led_cdev.brightness = led->brightness;
+}
+
 /*
  * Speed conversion helpers
  * User speed: 0-100 (100 = fastest)
@@ -1081,6 +1100,7 @@ static ssize_t speed_show(struct device *dev,
 {
 	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
 
+	msi_claw_led_lazy_load(led);
 	return sysfs_emit(buf, "%d\n", led->speed);
 }
 
@@ -1284,14 +1304,10 @@ static int msi_claw_led_init(struct hid_device *hdev)
 	led->color[1] = 255;
 	led->color[2] = 255;
 
-	/* Wait for device to be ready, then read current config */
-	msleep(500);
-	ret = msi_claw_read_rgb_config(hdev, &led->speed, &led->brightness);
-	if (ret < 0) {
-		hid_warn(hdev, "hid-msi-claw LED: failed to read config, using defaults\n");
-		led->speed = 50;
-		led->brightness = 100;
-	}
+	/* Use defaults, lazy load from device on first sysfs access */
+	led->config_loaded = false;
+	led->speed = 50;
+	led->brightness = 100;
 
 	/* Setup multicolor LED */
 	led->subled_info[0].color_index = LED_COLOR_ID_RED;
