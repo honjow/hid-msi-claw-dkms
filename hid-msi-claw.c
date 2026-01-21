@@ -763,11 +763,11 @@ static int msi_claw_read_rgb_config(struct hid_device *hdev,
 		 buffer[6], buffer[7], buffer[8], buffer[9], buffer[10], buffer[11],
 		 buffer[12], buffer[13], buffer[14], buffer[15]);
 
-	/* Data starts at buffer[11], same as m_remap */
-	/* data[3] = device speed (0-20, 0=fastest) */
-	/* data[4] = brightness (0-100) */
-	device_speed = buffer[11 + 3];
-	*brightness = buffer[11 + 4];
+	/* Data starts at buffer[10] (differs from m_remap which uses buffer[11]) */
+	/* buffer[10] = frame_count, buffer[11] = effect_type */
+	/* buffer[12] = speed (0-20), buffer[13] = brightness (0-100) */
+	device_speed = buffer[12];
+	*brightness = buffer[13];
 
 	/* Convert device speed to user speed */
 	/* device_speed = (100 - user_speed) * 20 / 100 */
