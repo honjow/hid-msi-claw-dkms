@@ -760,9 +760,8 @@ static void msi_claw_build_breathe(struct msi_claw_rgb_config *cfg,
 				    struct msi_claw_led *led)
 {
 	cfg->frame_count = 2;
-	/* 2 frames: slight compensation, limit slowest to 15 */
-	/* breathe (2 frames): map to 5-80 range */
-	cfg->speed = msi_claw_speed_map(led->speed, 5, 80);
+	/* breathe (2 frames): map to range */
+	cfg->speed = msi_claw_speed_map(led->speed, 5, 100);
 	cfg->brightness = led->brightness;
 
 	/* Frame 0: main color */
@@ -781,8 +780,8 @@ static void msi_claw_build_chroma(struct msi_claw_rgb_config *cfg,
 	u8 r, g, b;
 
 	cfg->frame_count = 6;
-	/* chroma (6 frames): map to 10-80 range for slower animation */
-	cfg->speed = msi_claw_speed_map(led->speed, 10, 80);
+	/* chroma (6 frames): map to range for slower animation */
+	cfg->speed = msi_claw_speed_map(led->speed, 5, 100);
 	cfg->brightness = led->brightness;
 
 	for (i = 0; i < 6; i++) {
@@ -801,8 +800,8 @@ static void msi_claw_build_rainbow(struct msi_claw_rgb_config *cfg,
 	u16 hue;
 
 	cfg->frame_count = 4;
-	/* rainbow (4 frames): map to 10-80 range */
-	cfg->speed = msi_claw_speed_map(led->speed, 10, 80);
+	/* rainbow (4 frames): map to range */
+	cfg->speed = msi_claw_speed_map(led->speed, 10, 100);
 	cfg->brightness = led->brightness;
 
 	for (frame = 0; frame < 4; frame++) {
