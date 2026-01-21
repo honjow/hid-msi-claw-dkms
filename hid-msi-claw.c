@@ -715,29 +715,32 @@ out:
  * Device speed: 0-20 (0 = fastest, acts like frame interval)
  */
 
-/* Convert user speed (0-100) to device speed (0-20), no compensation */
+/* Convert user speed (0-100, 100=fastest) to device speed (0-20, 0=fastest) */
 static inline u8 msi_claw_speed_to_device(u8 user_speed)
 {
 	return (100 - user_speed) * 20 / 100;
 }
 
 /*
- * Convert with compensation for multi-frame effects
- * Limits the slowest speed to avoid overly slow animations
- * min_speed: minimum device speed (fastest limit)
- * max_speed: maximum device speed (slowest limit, < 20)
+ * Map user speed (0-100) to a sub-range, then convert to device speed
+ * This allows multi-frame effects to have compensated speed ranges
+ *
+ * range_slow: output speed when user_speed=0 (user scale 0-100, 0=slowest)
+ * range_fast: output speed when user_speed=100 (user scale 0-100, 100=fastest)
+ *
+ * Example: msi_claw_speed_map(speed, 10, 50)
+ *   user=0   -> mapped=10 -> device=18 (slow)
+ *   user=100 -> mapped=50 -> device=10 (fast)
+ *   user=50  -> mapped=30 -> device=14 (medium)
  */
-static inline u8 msi_claw_speed_to_device_compensated(u8 user_speed,
-						       u8 min_speed, u8 max_speed)
+static inline u8 msi_claw_speed_map(u8 user_speed, u8 range_slow, u8 range_fast)
 {
-	u8 base = msi_claw_speed_to_device(user_speed);
+	u8 mapped;
 
-	/* Clamp to [min_speed, max_speed] range */
-	if (base < min_speed)
-		return min_speed;
-	if (base > max_speed)
-		return max_speed;
-	return base;
+	/* Map user 0-100 to range_slow-range_fast */
+	mapped = range_slow + (range_fast - range_slow) * user_speed / 100;
+	/* Convert to device speed (invert: 0=fast, 20=slow) */
+	return (100 - mapped) * 20 / 100;
 }
 
 /* Build solid effect (1 frame, all zones same color) */
@@ -758,7 +761,8 @@ static void msi_claw_build_breathe(struct msi_claw_rgb_config *cfg,
 {
 	cfg->frame_count = 2;
 	/* 2 frames: slight compensation, limit slowest to 15 */
-	cfg->speed = msi_claw_speed_to_device_compensated(led->speed, 0, 15);
+	/* breathe (2 frames): map to 5-80 range */
+	cfg->speed = msi_claw_speed_map(led->speed, 5, 80);
 	cfg->brightness = led->brightness;
 
 	/* Frame 0: main color */
@@ -777,8 +781,8 @@ static void msi_claw_build_chroma(struct msi_claw_rgb_config *cfg,
 	u8 r, g, b;
 
 	cfg->frame_count = 6;
-	/* 6 frames: stronger compensation, limit slowest to 10 */
-	cfg->speed = msi_claw_speed_to_device_compensated(led->speed, 0, 10);
+	/* chroma (6 frames): map to 10-80 range for slower animation */
+	cfg->speed = msi_claw_speed_map(led->speed, 10, 80);
 	cfg->brightness = led->brightness;
 
 	for (i = 0; i < 6; i++) {
@@ -797,8 +801,8 @@ static void msi_claw_build_rainbow(struct msi_claw_rgb_config *cfg,
 	u16 hue;
 
 	cfg->frame_count = 4;
-	/* 4 frames: moderate compensation, limit slowest to 12 */
-	cfg->speed = msi_claw_speed_to_device_compensated(led->speed, 0, 12);
+	/* rainbow (4 frames): map to 10-80 range */
+	cfg->speed = msi_claw_speed_map(led->speed, 10, 80);
 	cfg->brightness = led->brightness;
 
 	for (frame = 0; frame < 4; frame++) {
