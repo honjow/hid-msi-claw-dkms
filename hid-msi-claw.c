@@ -628,7 +628,7 @@ static int msi_claw_send_rgb_config(struct hid_device *hdev,
 				     struct msi_claw_rgb_config *cfg)
 {
 	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
-	u8 cmd_buffer[55];  /* Max data per packet */
+	u8 cmd_buffer[64];  /* 4 byte header + max 55 bytes data + padding */
 	int ret, frame, offset, chunk_size;
 	u16 base_addr, current_addr;
 	u8 *data;
@@ -876,10 +876,11 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 		break;
 	case MSI_CLAW_LED_EFFECT_CUSTOM:
 		if (led->custom_frame_count == 0) {
-			hid_warn(led->hdev, "hid-msi-claw LED: no custom keyframes\n");
-			return -EINVAL;
+			/* No keyframes set, use monocolor as fallback */
+			msi_claw_build_monocolor(&cfg, led);
+		} else {
+			msi_claw_build_custom(&cfg, led);
 		}
-		msi_claw_build_custom(&cfg, led);
 		break;
 	default:
 		return -EINVAL;
