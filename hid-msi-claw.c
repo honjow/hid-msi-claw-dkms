@@ -851,6 +851,12 @@ static void msi_claw_build_custom(struct msi_claw_rgb_config *cfg,
 static int msi_claw_apply_effect(struct msi_claw_led *led)
 {
 	struct msi_claw_rgb_config cfg = {};
+	int ret;
+
+	hid_info(led->hdev, "LED apply: enabled=%d effect=%s speed=%d brightness=%d color=[%d,%d,%d]\n",
+		 led->enabled, led_effect_names[led->effect],
+		 led->speed, led->brightness,
+		 led->color[0], led->color[1], led->color[2]);
 
 	if (!led->enabled) {
 		/* Send black frame with brightness 0 */
@@ -858,6 +864,7 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 		cfg.speed = 0;
 		cfg.brightness = 0;
 		msi_claw_frame_fill_solid(&cfg.frames[0], 0, 0, 0);
+		hid_info(led->hdev, "LED disabled, sending black frame\n");
 		return msi_claw_send_rgb_config(led->hdev, &cfg);
 	}
 
@@ -877,6 +884,7 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 	case MSI_CLAW_LED_EFFECT_CUSTOM:
 		if (led->custom_frame_count == 0) {
 			/* No keyframes set, use monocolor as fallback */
+			hid_info(led->hdev, "LED custom: no keyframes, fallback to monocolor\n");
 			msi_claw_build_monocolor(&cfg, led);
 		} else {
 			msi_claw_build_custom(&cfg, led);
@@ -886,7 +894,14 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 		return -EINVAL;
 	}
 
-	return msi_claw_send_rgb_config(led->hdev, &cfg);
+	hid_info(led->hdev, "LED sending: frames=%d speed=%d brightness=%d\n",
+		 cfg.frame_count, cfg.speed, cfg.brightness);
+
+	ret = msi_claw_send_rgb_config(led->hdev, &cfg);
+	if (ret)
+		hid_err(led->hdev, "LED send failed: %d\n", ret);
+
+	return ret;
 }
 
 /* ========== LED sysfs attributes ========== */
@@ -919,6 +934,9 @@ static ssize_t enabled_store(struct device *dev,
 	ret = kstrtobool(buf, &val);
 	if (ret)
 		return ret;
+
+	hid_info(led->hdev, "LED enabled_store: %s -> %s\n",
+		 led->enabled ? "true" : "false", val ? "true" : "false");
 
 	if (val == led->enabled)
 		return count;
@@ -958,6 +976,9 @@ static ssize_t effect_store(struct device *dev,
 
 	if (sscanf(buf, "%15s", effect_name) != 1)
 		return -EINVAL;
+
+	hid_info(led->hdev, "LED effect_store: %s -> %s\n",
+		 led_effect_names[led->effect], effect_name);
 
 	for (i = 0; i < MSI_CLAW_LED_EFFECT_MAX; i++) {
 		if (strcmp(effect_name, led_effect_names[i]) == 0) {
@@ -1009,10 +1030,12 @@ static ssize_t speed_store(struct device *dev,
 	if (val > 100)
 		return -EINVAL;
 
+	hid_info(led->hdev, "LED speed_store: %d -> %d\n", led->speed, val);
+
 	led->speed = val;
 
-	/* Apply if not monocolor effect (monocolor doesn't use speed) */
-	if (led->effect != MSI_CLAW_LED_EFFECT_MONOCOLOR && led->enabled) {
+	/* Apply immediately if enabled */
+	if (led->enabled) {
 		ret = msi_claw_apply_effect(led);
 		if (ret)
 			return ret;
@@ -1142,11 +1165,15 @@ static int msi_claw_led_brightness_set(struct led_classdev *cdev,
 	led->color[1] = mc->subled_info[1].brightness;
 	led->color[2] = mc->subled_info[2].brightness;
 
+	hid_info(led->hdev, "LED brightness_set: %d -> %d, color=[%d,%d,%d]\n",
+		 led->brightness, brightness,
+		 led->color[0], led->color[1], led->color[2]);
+
 	/* Store brightness directly (0-100) */
 	led->brightness = brightness;
 
-	/* Apply if monocolor effect and enabled */
-	if (led->effect == MSI_CLAW_LED_EFFECT_MONOCOLOR && led->enabled)
+	/* Apply immediately if enabled */
+	if (led->enabled)
 		return msi_claw_apply_effect(led);
 
 	return 0;
