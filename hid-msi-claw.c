@@ -757,6 +757,12 @@ static int msi_claw_read_rgb_config(struct hid_device *hdev,
 		return -EINVAL;
 	}
 
+	/* Debug: print buffer contents */
+	hid_info(hdev, "LED read buffer[0..15]: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		 buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5],
+		 buffer[6], buffer[7], buffer[8], buffer[9], buffer[10], buffer[11],
+		 buffer[12], buffer[13], buffer[14], buffer[15]);
+
 	/* Data starts at buffer[11], same as m_remap */
 	/* data[3] = device speed (0-20, 0=fastest) */
 	/* data[4] = brightness (0-100) */
