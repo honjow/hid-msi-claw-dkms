@@ -709,6 +709,69 @@ out:
 	return ret;
 }
 
+/* Read RGB config from device */
+static int msi_claw_read_rgb_config(struct hid_device *hdev,
+				    u8 *speed, u8 *brightness)
+{
+	struct msi_claw_drvdata *drvdata = hid_get_drvdata(hdev);
+	u8 cmd_buffer[4];
+	u8 buffer[MSI_CLAW_READ_SIZE] = {};
+	u8 device_speed;
+	int ret;
+
+	if (!drvdata->control) {
+		hid_err(hdev, "hid-msi-claw LED: no control interface\n");
+		return -ENODEV;
+	}
+
+	if (!drvdata->rgb_addr) {
+		hid_err(hdev, "hid-msi-claw LED: no RGB address\n");
+		return -ENODEV;
+	}
+
+	cmd_buffer[0] = 0x01;  /* profile */
+	cmd_buffer[1] = drvdata->rgb_addr[0];
+	cmd_buffer[2] = drvdata->rgb_addr[1];
+	cmd_buffer[3] = 5;  /* read 5 bytes (header only) */
+
+	ret = msi_claw_write_cmd(hdev, MSI_CLAW_COMMAND_TYPE_READ_PROFILE,
+				 cmd_buffer, sizeof(cmd_buffer));
+	if (ret < 0) {
+		hid_err(hdev, "hid-msi-claw LED: failed to send read request: %d\n", ret);
+		return ret;
+	}
+
+	ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 50);
+	if (ret != MSI_CLAW_READ_SIZE) {
+		hid_err(hdev, "hid-msi-claw LED: failed to read config: %d\n", ret);
+		return -EINVAL;
+	}
+
+	if (buffer[4] != (u8)MSI_CLAW_COMMAND_TYPE_READ_PROFILE_ACK) {
+		hid_err(hdev, "hid-msi-claw LED: expected READ_PROFILE_ACK (0x05), got 0x%02x\n",
+			buffer[4]);
+		return -EINVAL;
+	}
+
+	/* Data starts at buffer[11], same as m_remap */
+	/* data[3] = device speed (0-20, 0=fastest) */
+	/* data[4] = brightness (0-100) */
+	device_speed = buffer[11 + 3];
+	*brightness = buffer[11 + 4];
+
+	/* Convert device speed to user speed */
+	/* device_speed = (100 - user_speed) * 20 / 100 */
+	/* user_speed = 100 - device_speed * 100 / 20 */
+	if (device_speed > 20)
+		device_speed = 20;
+	*speed = 100 - device_speed * 100 / 20;
+
+	hid_info(hdev, "hid-msi-claw LED: read config: device_speed=%d -> speed=%d, brightness=%d\n",
+		 device_speed, *speed, *brightness);
+
+	return 0;
+}
+
 /*
  * Speed conversion helpers
  * User speed: 0-100 (100 = fastest)
@@ -1208,14 +1271,23 @@ static int msi_claw_led_init(struct hid_device *hdev)
 	if (!led)
 		return -ENOMEM;
 
+	/* Set rgb_addr first so we can read config */
+	drvdata->rgb_addr = msi_claw_get_rgb_addr(drvdata->bcd_device);
+
 	led->hdev = hdev;
 	led->enabled = true;
 	led->effect = MSI_CLAW_LED_EFFECT_MONOCOLOR;
-	led->speed = 10;
-	led->brightness = 100;
 	led->color[0] = 255;
 	led->color[1] = 255;
 	led->color[2] = 255;
+
+	/* Try to read current speed and brightness from device */
+	ret = msi_claw_read_rgb_config(hdev, &led->speed, &led->brightness);
+	if (ret < 0) {
+		hid_warn(hdev, "hid-msi-claw LED: failed to read config, using defaults\n");
+		led->speed = 50;
+		led->brightness = 100;
+	}
 
 	/* Setup multicolor LED */
 	led->subled_info[0].color_index = LED_COLOR_ID_RED;
@@ -1226,7 +1298,7 @@ static int msi_claw_led_init(struct hid_device *hdev)
 	led->subled_info[2].intensity = 255;
 
 	led->mc_cdev.led_cdev.name = MSI_CLAW_LED_NAME;
-	led->mc_cdev.led_cdev.brightness = 100;
+	led->mc_cdev.led_cdev.brightness = led->brightness;
 	led->mc_cdev.led_cdev.max_brightness = 100;
 	led->mc_cdev.led_cdev.brightness_set_blocking = msi_claw_led_brightness_set;
 	led->mc_cdev.num_colors = 3;
@@ -1275,7 +1347,6 @@ static int msi_claw_led_init(struct hid_device *hdev)
 		goto err_keyframes;
 
 	drvdata->led = led;
-	drvdata->rgb_addr = msi_claw_get_rgb_addr(drvdata->bcd_device);
 
 	hid_info(hdev, "hid-msi-claw: LED initialized (rgb_addr: 0x%02x%02x)\n",
 		 drvdata->rgb_addr[0], drvdata->rgb_addr[1]);
