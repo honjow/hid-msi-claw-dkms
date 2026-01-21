@@ -734,6 +734,9 @@ static int msi_claw_read_rgb_config(struct hid_device *hdev,
 	cmd_buffer[2] = drvdata->rgb_addr[1];
 	cmd_buffer[3] = 5;  /* read 5 bytes (header only) */
 
+	/* Flush any pending data before reading */
+	msi_claw_flush_queue(hdev);
+
 	ret = msi_claw_write_cmd(hdev, MSI_CLAW_COMMAND_TYPE_READ_PROFILE,
 				 cmd_buffer, sizeof(cmd_buffer));
 	if (ret < 0) {
@@ -741,7 +744,7 @@ static int msi_claw_read_rgb_config(struct hid_device *hdev,
 		return ret;
 	}
 
-	ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 50);
+	ret = msi_claw_read(hdev, buffer, MSI_CLAW_READ_SIZE, 100);
 	if (ret != MSI_CLAW_READ_SIZE) {
 		hid_err(hdev, "hid-msi-claw LED: failed to read config: %d\n", ret);
 		return -EINVAL;
@@ -1281,7 +1284,8 @@ static int msi_claw_led_init(struct hid_device *hdev)
 	led->color[1] = 255;
 	led->color[2] = 255;
 
-	/* Try to read current speed and brightness from device */
+	/* Wait for device to be ready, then read current config */
+	msleep(500);
 	ret = msi_claw_read_rgb_config(hdev, &led->speed, &led->brightness);
 	if (ret < 0) {
 		hid_warn(hdev, "hid-msi-claw LED: failed to read config, using defaults\n");
