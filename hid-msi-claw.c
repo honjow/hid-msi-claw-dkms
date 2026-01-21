@@ -932,32 +932,9 @@ static DEVICE_ATTR_RW(enabled);
 static ssize_t enabled_index_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
-	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
-
-	return sysfs_emit(buf, "%s\n", led->enabled ? "true" : "false");
+	return sysfs_emit(buf, "true false\n");
 }
-
-static ssize_t enabled_index_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t count)
-{
-	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
-	bool val;
-	int ret;
-
-	ret = kstrtobool(buf, &val);
-	if (ret)
-		return ret;
-
-	if (val == led->enabled)
-		return count;
-
-	led->enabled = val;
-	ret = msi_claw_apply_effect(led);
-
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_RW(enabled_index);
+static DEVICE_ATTR_RO(enabled_index);
 
 static ssize_t effect_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
@@ -996,36 +973,17 @@ static DEVICE_ATTR_RW(effect);
 static ssize_t effect_index_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
-	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
-
-	if (led->effect >= MSI_CLAW_LED_EFFECT_MAX)
-		return -EINVAL;
-
-	return sysfs_emit(buf, "%s\n", led_effect_names[led->effect]);
-}
-
-static ssize_t effect_index_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
-	int i, ret;
-	char effect_name[16];
-
-	if (sscanf(buf, "%15s", effect_name) != 1)
-		return -EINVAL;
+	int i, len = 0;
 
 	for (i = 0; i < MSI_CLAW_LED_EFFECT_MAX; i++) {
-		if (strcmp(effect_name, led_effect_names[i]) == 0) {
-			led->effect = i;
-			ret = msi_claw_apply_effect(led);
-			return ret ? ret : count;
-		}
+		len += sysfs_emit_at(buf, len, "%s ", led_effect_names[i]);
 	}
+	if (len > 0)
+		buf[len - 1] = '\n';
 
-	return -EINVAL;
+	return len;
 }
-static DEVICE_ATTR_RW(effect_index);
+static DEVICE_ATTR_RO(effect_index);
 
 static ssize_t speed_show(struct device *dev,
 			  struct device_attribute *attr, char *buf)
