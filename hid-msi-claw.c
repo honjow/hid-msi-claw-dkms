@@ -2273,7 +2273,27 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 		return ret;
 	}
 
-	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+	/*
+	 * For non-control interfaces (gamepad, keyboard), use HID_CONNECT_DEFAULT
+	 * to create normal input devices. Don't call hid_hw_open() so we don't
+	 * hold the HID transport, allowing hhd to grab the evdev devices.
+	 */
+	if (hdev->rdesc[0] != MSI_CLAW_DEVICE_CONTROL_DESC) {
+		ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+		if (ret) {
+			hid_err(hdev, "hid-msi-claw hw start failed: %d\n", ret);
+			return ret;
+		}
+		hid_info(hdev, "hid-msi-claw: bound non-control interface (0x%02x)\n",
+			 hdev->rdesc[0]);
+		return 0;
+	}
+
+	/*
+	 * For control interface: use HID_CONNECT_HIDRAW only (no input devices)
+	 * and open the HID transport for sending commands.
+	 */
+	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW | HID_CONNECT_DRIVER);
 	if (ret) {
 		hid_err(hdev, "hid-msi-claw hw start failed: %d\n", ret);
 		return ret;
@@ -2409,9 +2429,11 @@ static void msi_claw_remove(struct hid_device *hdev)
 		sysfs_remove_file(&hdev->dev.kobj, &dev_attr_mkeys_function_available.attr);
 		sysfs_remove_file(&hdev->dev.kobj, &dev_attr_mkeys_function_current.attr);
 		sysfs_remove_file(&hdev->dev.kobj, &dev_attr_reset.attr);
+
+		/* Only close if we opened (control interface only) */
+		hid_hw_close(hdev);
 	}
 
-	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
 }
 
