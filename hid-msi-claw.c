@@ -2274,14 +2274,22 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 	}
 
 	/*
-	 * Only bind to the control interface (0x06).
-	 * Return -ENODEV for other interfaces so hid-generic handles them.
-	 * This ensures hhd can properly grab the evdev devices.
+	 * For non-control interfaces (keyboard/mouse), use HID_CONNECT_DEFAULT
+	 * with INPUT_PER_APP quirk to create separate keyboard/mouse devices.
+	 * This matches hid-generic behavior and allows userspace to grab the devices.
 	 */
 	if (hdev->rdesc[0] != MSI_CLAW_DEVICE_CONTROL_DESC) {
-		hid_dbg(hdev, "hid-msi-claw: skipping non-control interface (0x%02x)\n",
+		hid_dbg(hdev, "non-control interface (0x%02x), using HID_CONNECT_DEFAULT\n",
 			hdev->rdesc[0]);
-		return -ENODEV;
+		/* Set quirk to create separate input devices per HID application */
+		hdev->quirks |= HID_QUIRK_INPUT_PER_APP;
+		ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+		if (ret) {
+			hid_err(hdev, "hw start failed for non-control: %d\n", ret);
+			return ret;
+		}
+		/* Don't call hid_hw_open() - let userspace grab the device */
+		return 0;
 	}
 
 	/*
