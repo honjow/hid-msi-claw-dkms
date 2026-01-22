@@ -26,7 +26,6 @@ enum msi_claw_led_effect {
 	MSI_CLAW_LED_EFFECT_BREATHE,
 	MSI_CLAW_LED_EFFECT_CHROMA,
 	MSI_CLAW_LED_EFFECT_RAINBOW,
-	MSI_CLAW_LED_EFFECT_CUSTOM,
 
 	MSI_CLAW_LED_EFFECT_MAX,
 };
@@ -36,7 +35,18 @@ static const char * const led_effect_names[] = {
 	[MSI_CLAW_LED_EFFECT_BREATHE] = "breathe",
 	[MSI_CLAW_LED_EFFECT_CHROMA] = "chroma",
 	[MSI_CLAW_LED_EFFECT_RAINBOW] = "rainbow",
-	[MSI_CLAW_LED_EFFECT_CUSTOM] = "custom",
+};
+
+enum msi_claw_led_mode {
+	MSI_CLAW_LED_MODE_DYNAMIC = 0,
+	MSI_CLAW_LED_MODE_CUSTOM,
+
+	MSI_CLAW_LED_MODE_MAX,
+};
+
+static const char * const led_mode_names[] = {
+	[MSI_CLAW_LED_MODE_DYNAMIC] = "dynamic",
+	[MSI_CLAW_LED_MODE_CUSTOM] = "custom",
 };
 
 struct msi_claw_rgb_frame {
@@ -58,7 +68,8 @@ struct msi_claw_led {
 	/* State */
 	bool enabled;
 	bool config_loaded;  /* true if speed/brightness read from device */
-	enum msi_claw_led_effect effect;
+	enum msi_claw_led_mode mode;      /* dynamic or custom */
+	enum msi_claw_led_effect effect;  /* preset effect (when mode=dynamic) */
 	u8 speed;          /* 0-100 (user value, mapped to 0-20 for device) */
 	u8 brightness;     /* 0-100 */
 
@@ -947,8 +958,8 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 	struct msi_claw_rgb_config cfg = {};
 	int ret;
 
-	hid_info(led->hdev, "LED apply: enabled=%d effect=%s speed=%d brightness=%d color=[%d,%d,%d]\n",
-		 led->enabled, led_effect_names[led->effect],
+	hid_info(led->hdev, "LED apply: enabled=%d mode=%s effect=%s speed=%d brightness=%d color=[%d,%d,%d]\n",
+		 led->enabled, led_mode_names[led->mode], led_effect_names[led->effect],
 		 led->speed, led->brightness,
 		 led->color[0], led->color[1], led->color[2]);
 
@@ -962,30 +973,32 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 		return msi_claw_send_rgb_config(led->hdev, &cfg);
 	}
 
-	switch (led->effect) {
-	case MSI_CLAW_LED_EFFECT_MONOCOLOR:
-		msi_claw_build_monocolor(&cfg, led);
-		break;
-	case MSI_CLAW_LED_EFFECT_BREATHE:
-		msi_claw_build_breathe(&cfg, led);
-		break;
-	case MSI_CLAW_LED_EFFECT_CHROMA:
-		msi_claw_build_chroma(&cfg, led);
-		break;
-	case MSI_CLAW_LED_EFFECT_RAINBOW:
-		msi_claw_build_rainbow(&cfg, led);
-		break;
-	case MSI_CLAW_LED_EFFECT_CUSTOM:
+	if (led->mode == MSI_CLAW_LED_MODE_CUSTOM) {
+		/* Custom mode: use keyframes */
 		if (led->custom_frame_count == 0) {
-			/* No keyframes set, use monocolor as fallback */
 			hid_info(led->hdev, "LED custom: no keyframes, fallback to monocolor\n");
 			msi_claw_build_monocolor(&cfg, led);
 		} else {
 			msi_claw_build_custom(&cfg, led);
 		}
-		break;
-	default:
-		return -EINVAL;
+	} else {
+		/* Dynamic mode: use preset effect */
+		switch (led->effect) {
+		case MSI_CLAW_LED_EFFECT_MONOCOLOR:
+			msi_claw_build_monocolor(&cfg, led);
+			break;
+		case MSI_CLAW_LED_EFFECT_BREATHE:
+			msi_claw_build_breathe(&cfg, led);
+			break;
+		case MSI_CLAW_LED_EFFECT_CHROMA:
+			msi_claw_build_chroma(&cfg, led);
+			break;
+		case MSI_CLAW_LED_EFFECT_RAINBOW:
+			msi_claw_build_rainbow(&cfg, led);
+			break;
+		default:
+			return -EINVAL;
+		}
 	}
 
 	hid_info(led->hdev, "LED sending: frames=%d speed=%d brightness=%d\n",
@@ -1100,6 +1113,58 @@ static ssize_t effect_index_show(struct device *dev,
 	return len;
 }
 static DEVICE_ATTR_RO(effect_index);
+
+static ssize_t mode_show(struct device *dev,
+			 struct device_attribute *attr, char *buf)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+
+	if (led->mode >= MSI_CLAW_LED_MODE_MAX)
+		return -EINVAL;
+
+	return sysfs_emit(buf, "%s\n", led_mode_names[led->mode]);
+}
+
+static ssize_t mode_store(struct device *dev,
+			  struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct msi_claw_led *led = dev_to_msi_claw_led(dev);
+	int i, ret;
+	char mode_name[16];
+
+	if (sscanf(buf, "%15s", mode_name) != 1)
+		return -EINVAL;
+
+	hid_info(led->hdev, "LED mode_store: %s -> %s\n",
+		 led_mode_names[led->mode], mode_name);
+
+	for (i = 0; i < MSI_CLAW_LED_MODE_MAX; i++) {
+		if (strcmp(mode_name, led_mode_names[i]) == 0) {
+			led->mode = i;
+			ret = msi_claw_apply_effect(led);
+			return ret ? ret : count;
+		}
+	}
+
+	return -EINVAL;
+}
+static DEVICE_ATTR_RW(mode);
+
+static ssize_t mode_index_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	int i, len = 0;
+
+	for (i = 0; i < MSI_CLAW_LED_MODE_MAX; i++) {
+		len += sysfs_emit_at(buf, len, "%s ", led_mode_names[i]);
+	}
+	if (len > 0)
+		buf[len - 1] = '\n';
+
+	return len;
+}
+static DEVICE_ATTR_RO(mode_index);
 
 static ssize_t speed_show(struct device *dev,
 			  struct device_attribute *attr, char *buf)
@@ -1232,8 +1297,8 @@ static ssize_t keyframes_store(struct device *dev,
 	led->custom_frame_count = frame_count;
 	memcpy(led->custom_frames, frames, frame_count * sizeof(frames[0]));
 
-	/* Apply if custom effect is active */
-	if (led->effect == MSI_CLAW_LED_EFFECT_CUSTOM && led->enabled) {
+	/* Apply if custom mode is active */
+	if (led->mode == MSI_CLAW_LED_MODE_CUSTOM && led->enabled) {
 		ret = msi_claw_apply_effect(led);
 		if (ret)
 			return ret;
@@ -1305,6 +1370,7 @@ static int msi_claw_led_init(struct hid_device *hdev)
 
 	led->hdev = hdev;
 	led->enabled = true;
+	led->mode = MSI_CLAW_LED_MODE_DYNAMIC;
 	led->effect = MSI_CLAW_LED_EFFECT_MONOCOLOR;
 	led->color[0] = 255;
 	led->color[1] = 255;
@@ -1358,6 +1424,16 @@ static int msi_claw_led_init(struct hid_device *hdev)
 		goto err_effect_index;
 
 	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_mode.attr);
+	if (ret)
+		goto err_mode;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
+				&dev_attr_mode_index.attr);
+	if (ret)
+		goto err_mode_index;
+
+	ret = sysfs_create_file(&led->mc_cdev.led_cdev.dev->kobj,
 				&dev_attr_speed.attr);
 	if (ret)
 		goto err_speed;
@@ -1384,6 +1460,10 @@ err_keyframes:
 err_speed_range:
 	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_speed.attr);
 err_speed:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_mode_index.attr);
+err_mode_index:
+	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_mode.attr);
+err_mode:
 	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_effect_index.attr);
 err_effect_index:
 	sysfs_remove_file(&led->mc_cdev.led_cdev.dev->kobj, &dev_attr_effect.attr);
@@ -1409,6 +1489,8 @@ static void msi_claw_led_exit(struct hid_device *hdev)
 	sysfs_remove_file(kobj, &dev_attr_keyframes.attr);
 	sysfs_remove_file(kobj, &dev_attr_speed_range.attr);
 	sysfs_remove_file(kobj, &dev_attr_speed.attr);
+	sysfs_remove_file(kobj, &dev_attr_mode_index.attr);
+	sysfs_remove_file(kobj, &dev_attr_mode.attr);
 	sysfs_remove_file(kobj, &dev_attr_effect_index.attr);
 	sysfs_remove_file(kobj, &dev_attr_effect.attr);
 	sysfs_remove_file(kobj, &dev_attr_enabled_index.attr);
