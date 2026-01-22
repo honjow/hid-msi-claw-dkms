@@ -26,6 +26,7 @@ enum msi_claw_led_effect {
 	MSI_CLAW_LED_EFFECT_BREATHE,
 	MSI_CLAW_LED_EFFECT_CHROMA,
 	MSI_CLAW_LED_EFFECT_RAINBOW,
+	MSI_CLAW_LED_EFFECT_FROSTFIRE,
 
 	MSI_CLAW_LED_EFFECT_MAX,
 };
@@ -35,6 +36,7 @@ static const char * const led_effect_names[] = {
 	[MSI_CLAW_LED_EFFECT_BREATHE] = "breathe",
 	[MSI_CLAW_LED_EFFECT_CHROMA] = "chroma",
 	[MSI_CLAW_LED_EFFECT_RAINBOW] = "rainbow",
+	[MSI_CLAW_LED_EFFECT_FROSTFIRE] = "frostfire",
 };
 
 enum msi_claw_led_mode {
@@ -932,6 +934,59 @@ static void msi_claw_build_rainbow(struct msi_claw_rgb_config *cfg,
 	}
 }
 
+/*
+ * Build frostfire effect (4 frames: fire vs ice rotating)
+ * Right joystick: fire red -> dark -> ice blue -> dark (clockwise)
+ * Left joystick: ice blue -> dark -> fire red -> dark (counter-clockwise)
+ * ABXY: fire red -> dark -> ice blue -> dark
+ */
+static void msi_claw_build_frostfire(struct msi_claw_rgb_config *cfg,
+				     struct msi_claw_led *led)
+{
+	/* Fire red, dark, ice blue, dark */
+	static const u8 right_colors[4][3] = {
+		{255, 0, 0},   /* Fire red */
+		{0, 0, 0},     /* Dark */
+		{0, 0, 255},   /* Ice blue */
+		{0, 0, 0},     /* Dark */
+	};
+	/* Ice blue, dark, fire red, dark (opposite phase) */
+	static const u8 left_colors[4][3] = {
+		{0, 0, 255},   /* Ice blue */
+		{0, 0, 0},     /* Dark */
+		{255, 0, 0},   /* Fire red */
+		{0, 0, 0},     /* Dark */
+	};
+	int frame, zone, color_idx;
+
+	cfg->frame_count = 4;
+	/* frostfire (4 frames): map to range */
+	cfg->speed = msi_claw_speed_map(led->speed, 10, 100);
+	cfg->brightness = led->brightness;
+
+	for (frame = 0; frame < 4; frame++) {
+		/* Right joystick (zones 0-3): clockwise rotation */
+		for (zone = 0; zone < 4; zone++) {
+			color_idx = (zone + frame) % 4;
+			cfg->frames[frame].zones[zone][0] = right_colors[color_idx][0];
+			cfg->frames[frame].zones[zone][1] = right_colors[color_idx][1];
+			cfg->frames[frame].zones[zone][2] = right_colors[color_idx][2];
+		}
+		/* Left joystick (zones 4-7): counter-clockwise rotation */
+		for (zone = 0; zone < 4; zone++) {
+			/* Subtract to rotate counter-clockwise, add 4 to keep positive */
+			color_idx = (zone - frame + 4) % 4;
+			cfg->frames[frame].zones[zone + 4][0] = left_colors[color_idx][0];
+			cfg->frames[frame].zones[zone + 4][1] = left_colors[color_idx][1];
+			cfg->frames[frame].zones[zone + 4][2] = left_colors[color_idx][2];
+		}
+		/* ABXY (zone 8): cycle same as right */
+		cfg->frames[frame].zones[8][0] = right_colors[frame][0];
+		cfg->frames[frame].zones[8][1] = right_colors[frame][1];
+		cfg->frames[frame].zones[8][2] = right_colors[frame][2];
+	}
+}
+
 /* Build custom effect from cached keyframes */
 static void msi_claw_build_custom(struct msi_claw_rgb_config *cfg,
 				   struct msi_claw_led *led)
@@ -995,6 +1050,9 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 			break;
 		case MSI_CLAW_LED_EFFECT_RAINBOW:
 			msi_claw_build_rainbow(&cfg, led);
+			break;
+		case MSI_CLAW_LED_EFFECT_FROSTFIRE:
+			msi_claw_build_frostfire(&cfg, led);
 			break;
 		default:
 			return -EINVAL;
