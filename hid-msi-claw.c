@@ -2274,19 +2274,14 @@ static int msi_claw_probe(struct hid_device *hdev, const struct hid_device_id *i
 	}
 
 	/*
-	 * For non-control interfaces (gamepad, keyboard), use HID_CONNECT_DEFAULT
-	 * to create normal input devices. Don't call hid_hw_open() so we don't
-	 * hold the HID transport, allowing hhd to grab the evdev devices.
+	 * Only bind to the control interface (0x06).
+	 * Return -ENODEV for other interfaces so hid-generic handles them.
+	 * This ensures hhd can properly grab the evdev devices.
 	 */
 	if (hdev->rdesc[0] != MSI_CLAW_DEVICE_CONTROL_DESC) {
-		ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
-		if (ret) {
-			hid_err(hdev, "hid-msi-claw hw start failed: %d\n", ret);
-			return ret;
-		}
-		hid_info(hdev, "hid-msi-claw: bound non-control interface (0x%02x)\n",
-			 hdev->rdesc[0]);
-		return 0;
+		hid_dbg(hdev, "hid-msi-claw: skipping non-control interface (0x%02x)\n",
+			hdev->rdesc[0]);
+		return -ENODEV;
 	}
 
 	/*
