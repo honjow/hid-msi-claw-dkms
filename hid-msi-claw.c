@@ -62,6 +62,9 @@ struct msi_claw_rgb_config {
 	struct msi_claw_rgb_frame frames[MSI_CLAW_LED_MAX_FRAMES];
 };
 
+/* Throttle interval for LED updates (in ms) */
+#define MSI_CLAW_LED_THROTTLE_MS 50
+
 struct msi_claw_led {
 	struct led_classdev_mc mc_cdev;
 	struct mc_subled subled_info[3];
@@ -81,6 +84,11 @@ struct msi_claw_led {
 	/* Custom effect keyframes cache */
 	u8 custom_frame_count;
 	u8 custom_frames[MSI_CLAW_LED_MAX_FRAMES][MSI_CLAW_LED_ZONES][3];
+
+	/* Throttling for sysfs writes */
+	struct delayed_work apply_work;
+	unsigned long last_apply_jiffies;
+	bool apply_pending;
 };
 
 enum msi_claw_gamepad_mode {
@@ -1069,6 +1077,50 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 	return ret;
 }
 
+/* Delayed work callback for throttled LED updates */
+static void msi_claw_led_apply_work_fn(struct work_struct *work)
+{
+	struct msi_claw_led *led = container_of(work, struct msi_claw_led,
+						apply_work.work);
+
+	led->apply_pending = false;
+	led->last_apply_jiffies = jiffies;
+	msi_claw_apply_effect(led);
+}
+
+/*
+ * Throttled apply: limits update rate while ensuring final value is sent.
+ * - If enough time has passed since last apply, send immediately
+ * - Otherwise, schedule a delayed work to send later (tail guarantee)
+ */
+static void msi_claw_led_apply_throttled(struct msi_claw_led *led)
+{
+	unsigned long elapsed_ms;
+	unsigned long delay_ms;
+
+	if (!led->enabled)
+		return;
+
+	elapsed_ms = jiffies_to_msecs(jiffies - led->last_apply_jiffies);
+
+	if (elapsed_ms >= MSI_CLAW_LED_THROTTLE_MS) {
+		/* Enough time passed, send immediately */
+		cancel_delayed_work(&led->apply_work);
+		led->apply_pending = false;
+		led->last_apply_jiffies = jiffies;
+		msi_claw_apply_effect(led);
+	} else {
+		/* Too soon, schedule delayed work */
+		if (!led->apply_pending) {
+			delay_ms = MSI_CLAW_LED_THROTTLE_MS - elapsed_ms;
+			led->apply_pending = true;
+			schedule_delayed_work(&led->apply_work,
+					      msecs_to_jiffies(delay_ms));
+		}
+		/* If already pending, the scheduled work will use latest values */
+	}
+}
+
 /* ========== LED sysfs attributes ========== */
 
 /* Helper to get msi_claw_led from LED device */
@@ -1248,16 +1300,12 @@ static ssize_t speed_store(struct device *dev,
 	if (val > 100)
 		return -EINVAL;
 
-	hid_info(led->hdev, "LED speed_store: %d -> %d\n", led->speed, val);
+	hid_dbg(led->hdev, "LED speed_store: %d -> %d\n", led->speed, val);
 
 	led->speed = val;
 
-	/* Apply immediately if enabled */
-	if (led->enabled) {
-		ret = msi_claw_apply_effect(led);
-		if (ret)
-			return ret;
-	}
+	/* Apply with throttling to avoid overwhelming the device */
+	msi_claw_led_apply_throttled(led);
 
 	return count;
 }
@@ -1439,6 +1487,11 @@ static int msi_claw_led_init(struct hid_device *hdev)
 	led->speed = 50;
 	led->brightness = 100;
 
+	/* Initialize throttling */
+	INIT_DELAYED_WORK(&led->apply_work, msi_claw_led_apply_work_fn);
+	led->last_apply_jiffies = jiffies;
+	led->apply_pending = false;
+
 	/* Setup multicolor LED */
 	led->subled_info[0].color_index = LED_COLOR_ID_RED;
 	led->subled_info[0].intensity = 255;
@@ -1541,6 +1594,9 @@ static void msi_claw_led_exit(struct hid_device *hdev)
 
 	if (!drvdata->led)
 		return;
+
+	/* Cancel any pending throttled work */
+	cancel_delayed_work_sync(&drvdata->led->apply_work);
 
 	kobj = &drvdata->led->mc_cdev.led_cdev.dev->kobj;
 
