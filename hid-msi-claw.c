@@ -88,7 +88,6 @@ struct msi_claw_led {
 	/* Throttling for sysfs writes */
 	struct delayed_work apply_work;
 	unsigned long last_apply_jiffies;
-	bool apply_pending;
 };
 
 enum msi_claw_gamepad_mode {
@@ -1021,10 +1020,10 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 	struct msi_claw_rgb_config cfg = {};
 	int ret;
 
-	hid_info(led->hdev, "LED apply: enabled=%d mode=%s effect=%s speed=%d brightness=%d color=[%d,%d,%d]\n",
-		 led->enabled, led_mode_names[led->mode], led_effect_names[led->effect],
-		 led->speed, led->brightness,
-		 led->color[0], led->color[1], led->color[2]);
+	hid_dbg(led->hdev, "LED apply: enabled=%d mode=%s effect=%s speed=%d brightness=%d color=[%d,%d,%d]\n",
+		led->enabled, led_mode_names[led->mode], led_effect_names[led->effect],
+		led->speed, led->brightness,
+		led->color[0], led->color[1], led->color[2]);
 
 	if (!led->enabled) {
 		/* Send black frame with brightness 0 */
@@ -1067,8 +1066,8 @@ static int msi_claw_apply_effect(struct msi_claw_led *led)
 		}
 	}
 
-	hid_info(led->hdev, "LED sending: frames=%d speed=%d brightness=%d\n",
-		 cfg.frame_count, cfg.speed, cfg.brightness);
+	hid_dbg(led->hdev, "LED sending: frames=%d speed=%d brightness=%d\n",
+		cfg.frame_count, cfg.speed, cfg.brightness);
 
 	ret = msi_claw_send_rgb_config(led->hdev, &cfg);
 	if (ret)
@@ -1083,15 +1082,14 @@ static void msi_claw_led_apply_work_fn(struct work_struct *work)
 	struct msi_claw_led *led = container_of(work, struct msi_claw_led,
 						apply_work.work);
 
-	led->apply_pending = false;
 	led->last_apply_jiffies = jiffies;
 	msi_claw_apply_effect(led);
 }
 
 /*
  * Throttled apply: limits update rate while ensuring final value is sent.
- * - If enough time has passed since last apply, send immediately
- * - Otherwise, schedule a delayed work to send later (tail guarantee)
+ * Always uses delayed_work to avoid blocking sysfs writes.
+ * This matches the async behavior of the LED subsystem's brightness handling.
  */
 static void msi_claw_led_apply_throttled(struct msi_claw_led *led)
 {
@@ -1103,22 +1101,18 @@ static void msi_claw_led_apply_throttled(struct msi_claw_led *led)
 
 	elapsed_ms = jiffies_to_msecs(jiffies - led->last_apply_jiffies);
 
+	/* Cancel any pending work and reschedule */
+	cancel_delayed_work(&led->apply_work);
+
 	if (elapsed_ms >= MSI_CLAW_LED_THROTTLE_MS) {
-		/* Enough time passed, send immediately */
-		cancel_delayed_work(&led->apply_work);
-		led->apply_pending = false;
-		led->last_apply_jiffies = jiffies;
-		msi_claw_apply_effect(led);
+		/* Enough time passed, schedule for immediate execution */
+		delay_ms = 0;
 	} else {
-		/* Too soon, schedule delayed work */
-		if (!led->apply_pending) {
-			delay_ms = MSI_CLAW_LED_THROTTLE_MS - elapsed_ms;
-			led->apply_pending = true;
-			schedule_delayed_work(&led->apply_work,
-					      msecs_to_jiffies(delay_ms));
-		}
-		/* If already pending, the scheduled work will use latest values */
+		/* Too soon, delay until throttle interval passes */
+		delay_ms = MSI_CLAW_LED_THROTTLE_MS - elapsed_ms;
 	}
+
+	schedule_delayed_work(&led->apply_work, msecs_to_jiffies(delay_ms));
 }
 
 /* ========== LED sysfs attributes ========== */
@@ -1431,9 +1425,9 @@ static int msi_claw_led_brightness_set(struct led_classdev *cdev,
 	led->color[1] = mc->subled_info[1].brightness;
 	led->color[2] = mc->subled_info[2].brightness;
 
-	hid_info(led->hdev, "LED brightness_set: %d -> %d, color=[%d,%d,%d]\n",
-		 led->brightness, brightness,
-		 led->color[0], led->color[1], led->color[2]);
+	hid_dbg(led->hdev, "LED brightness_set: %d -> %d, color=[%d,%d,%d]\n",
+		led->brightness, brightness,
+		led->color[0], led->color[1], led->color[2]);
 
 	/* Store brightness directly (0-100) */
 	led->brightness = brightness;
@@ -1490,7 +1484,6 @@ static int msi_claw_led_init(struct hid_device *hdev)
 	/* Initialize throttling */
 	INIT_DELAYED_WORK(&led->apply_work, msi_claw_led_apply_work_fn);
 	led->last_apply_jiffies = jiffies;
-	led->apply_pending = false;
 
 	/* Setup multicolor LED */
 	led->subled_info[0].color_index = LED_COLOR_ID_RED;
